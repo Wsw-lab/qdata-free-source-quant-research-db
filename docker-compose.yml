@@ -1,0 +1,294 @@
+name: qdata
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: qdata-postgres
+    environment:
+      POSTGRES_USER: qdata
+      POSTGRES_PASSWORD: qdata
+      POSTGRES_DB: qdata
+      TZ: Asia/Shanghai
+    ports:
+      - "15432:5432"
+    volumes:
+      - qdata-postgres-data:/var/lib/postgresql/data
+      - ./db/migrations/0001_postgresql_init.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+      - ./db/seed/postgresql_seed.sql:/docker-entrypoint-initdb.d/002_seed.sql:ro
+      - ./db/migrations/0003_postgresql_pipeline_scheduler.sql:/docker-entrypoint-initdb.d/003_pipeline_scheduler.sql:ro
+      - ./db/migrations/0004_postgresql_full_market_pipeline.sql:/docker-entrypoint-initdb.d/004_full_market_pipeline.sql:ro
+      - ./db/migrations/0005_postgresql_production_gamma.sql:/docker-entrypoint-initdb.d/005_production_gamma.sql:ro
+      - ./db/migrations/0006_postgresql_quant_market_delta.sql:/docker-entrypoint-initdb.d/006_quant_market_delta.sql:ro
+      - ./db/migrations/0007_postgresql_service_fusion_epsilon.sql:/docker-entrypoint-initdb.d/007_service_fusion_epsilon.sql:ro
+      - ./db/migrations/0008_postgresql_ops_zeta.sql:/docker-entrypoint-initdb.d/008_ops_zeta.sql:ro
+      - ./db/migrations/0009_postgresql_vendor_eta.sql:/docker-entrypoint-initdb.d/009_vendor_eta.sql:ro
+      - ./db/migrations/0010_postgresql_vendor_theta.sql:/docker-entrypoint-initdb.d/010_vendor_theta.sql:ro
+      - ./db/migrations/0011_postgresql_ops_iota.sql:/docker-entrypoint-initdb.d/011_ops_iota.sql:ro
+      - ./db/migrations/0012_postgresql_ops_lambda.sql:/docker-entrypoint-initdb.d/012_ops_lambda.sql:ro
+      - ./db/migrations/0013_postgresql_ops_mu.sql:/docker-entrypoint-initdb.d/013_ops_mu.sql:ro
+      - ./db/migrations/0014_postgresql_ops_nu.sql:/docker-entrypoint-initdb.d/014_ops_nu.sql:ro
+      - ./db/migrations/0015_postgresql_product_xi.sql:/docker-entrypoint-initdb.d/015_product_xi.sql:ro
+      - ./db/migrations/0016_postgresql_billing_omicron.sql:/docker-entrypoint-initdb.d/016_billing_omicron.sql:ro
+      - ./db/migrations/0017_postgresql_vendor_pi.sql:/docker-entrypoint-initdb.d/017_vendor_pi.sql:ro
+      - ./db/migrations/0018_postgresql_revenue_rho.sql:/docker-entrypoint-initdb.d/018_revenue_rho.sql:ro
+      - ./db/migrations/0019_postgresql_runtime_sigma.sql:/docker-entrypoint-initdb.d/019_runtime_sigma.sql:ro
+      - ./db/migrations/0020_postgresql_payments_tau.sql:/docker-entrypoint-initdb.d/020_payments_tau.sql:ro
+      - ./db/migrations/0021_postgresql_strategy_phi.sql:/docker-entrypoint-initdb.d/021_strategy_phi.sql:ro
+      - ./db/migrations/0022_postgresql_governance_chi.sql:/docker-entrypoint-initdb.d/022_governance_chi.sql:ro
+      - ./db/migrations/0023_postgresql_automation_psi.sql:/docker-entrypoint-initdb.d/023_automation_psi.sql:ro
+      - ./db/migrations/0024_postgresql_automation_omega.sql:/docker-entrypoint-initdb.d/024_automation_omega.sql:ro
+      - ./db/migrations/0025_postgresql_automation_alpha2.sql:/docker-entrypoint-initdb.d/025_automation_alpha2.sql:ro
+      - ./db/migrations/0026_postgresql_automation_beta2.sql:/docker-entrypoint-initdb.d/026_automation_beta2.sql:ro
+      - ./db/migrations/0027_postgresql_automation_gamma2.sql:/docker-entrypoint-initdb.d/027_automation_gamma2.sql:ro
+      - ./db/migrations/0028_postgresql_automation_delta2.sql:/docker-entrypoint-initdb.d/028_automation_delta2.sql:ro
+      - ./db/migrations/0029_postgresql_vendor_epsilon3_live_gate.sql:/docker-entrypoint-initdb.d/029_vendor_epsilon3_live_gate.sql:ro
+      - ./db/migrations/0030_postgresql_vendor_zeta3_onboarding.sql:/docker-entrypoint-initdb.d/030_vendor_zeta3_onboarding.sql:ro
+      - ./db/migrations/0031_postgresql_vendor_eta3_live_closure.sql:/docker-entrypoint-initdb.d/031_vendor_eta3_live_closure.sql:ro
+      - ./db/migrations/0032_postgresql_vendor_theta3_live_pilot.sql:/docker-entrypoint-initdb.d/032_vendor_theta3_live_pilot.sql:ro
+      - ./db/migrations/0033_postgresql_free_source_iota3_fabric.sql:/docker-entrypoint-initdb.d/033_free_source_iota3_fabric.sql:ro
+      - ./db/migrations/0034_postgresql_free_source_kappa5_reliability.sql:/docker-entrypoint-initdb.d/034_free_source_kappa5_reliability.sql:ro
+      - ./db/migrations/0035_postgresql_free_source_lambda5_recovery.sql:/docker-entrypoint-initdb.d/035_free_source_lambda5_recovery.sql:ro
+      - ./db/migrations/0036_postgresql_free_source_mu5_recovery_execution.sql:/docker-entrypoint-initdb.d/036_free_source_mu5_recovery_execution.sql:ro
+      - ./db/migrations/0037_postgresql_free_source_nu5_recovery_health.sql:/docker-entrypoint-initdb.d/037_free_source_nu5_recovery_health.sql:ro
+      - ./db/migrations/0038_postgresql_free_source_xi5_admission.sql:/docker-entrypoint-initdb.d/038_free_source_xi5_admission.sql:ro
+      - ./db/migrations/0039_postgresql_vendor_omicron5_contract.sql:/docker-entrypoint-initdb.d/039_vendor_omicron5_contract.sql:ro
+      - ./db/migrations/0040_postgresql_vendor_pi5_primary_promotion.sql:/docker-entrypoint-initdb.d/040_vendor_pi5_primary_promotion.sql:ro
+      - ./db/migrations/0041_postgresql_vendor_rho5_post_promotion_monitor.sql:/docker-entrypoint-initdb.d/041_vendor_rho5_post_promotion_monitor.sql:ro
+      - ./db/migrations/0042_postgresql_vendor_sigma5_primary_stability.sql:/docker-entrypoint-initdb.d/042_vendor_sigma5_primary_stability.sql:ro
+      - ./db/migrations/0043_postgresql_vendor_tau5_cost_optimization.sql:/docker-entrypoint-initdb.d/043_vendor_tau5_cost_optimization.sql:ro
+      - ./db/migrations/0044_postgresql_vendor_upsilon5_route_execution.sql:/docker-entrypoint-initdb.d/044_vendor_upsilon5_route_execution.sql:ro
+      - ./db/migrations/0045_postgresql_vendor_phi5_route_policy_runtime.sql:/docker-entrypoint-initdb.d/045_vendor_phi5_route_policy_runtime.sql:ro
+      - ./db/migrations/0046_postgresql_vendor_chi5_route_feedback.sql:/docker-entrypoint-initdb.d/046_vendor_chi5_route_feedback.sql:ro
+      - ./db/migrations/0047_postgresql_automation_psi5_route_incident.sql:/docker-entrypoint-initdb.d/047_automation_psi5_route_incident.sql:ro
+      - ./db/migrations/0048_postgresql_automation_omega5_route_incident_control.sql:/docker-entrypoint-initdb.d/048_automation_omega5_route_incident_control.sql:ro
+      - ./db/migrations/0049_postgresql_automation_alpha6_route_incident_control_health.sql:/docker-entrypoint-initdb.d/049_automation_alpha6_route_incident_control_health.sql:ro
+      - ./db/migrations/0050_postgresql_automation_beta6_route_incident_operations.sql:/docker-entrypoint-initdb.d/050_automation_beta6_route_incident_operations.sql:ro
+      - ./db/migrations/0051_postgresql_automation_gamma6_route_incident_approval_api.sql:/docker-entrypoint-initdb.d/051_automation_gamma6_route_incident_approval_api.sql:ro
+      - ./db/migrations/0052_postgresql_automation_delta6_route_incident_approval_governance.sql:/docker-entrypoint-initdb.d/052_automation_delta6_route_incident_approval_governance.sql:ro
+      - ./db/migrations/0053_postgresql_automation_epsilon6_route_incident_approval_resilience.sql:/docker-entrypoint-initdb.d/053_automation_epsilon6_route_incident_approval_resilience.sql:ro
+      - ./db/migrations/0054_postgresql_automation_zeta6_route_incident_approval_release.sql:/docker-entrypoint-initdb.d/054_automation_zeta6_route_incident_approval_release.sql:ro
+      - ./db/migrations/0055_postgresql_vendor_eta6_production_source_closure.sql:/docker-entrypoint-initdb.d/055_vendor_eta6_production_source_closure.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U qdata -d qdata"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: qdata-clickhouse
+    environment:
+      CLICKHOUSE_USER: qdata
+      CLICKHOUSE_PASSWORD: qdata
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      TZ: Asia/Shanghai
+    ports:
+      - "18123:8123"
+      - "19000:9000"
+    volumes:
+      - qdata-clickhouse-data:/var/lib/clickhouse
+      - ./db/migrations/0002_clickhouse_init.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+      - ./db/seed/clickhouse_seed.sql:/docker-entrypoint-initdb.d/002_seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --user qdata --password qdata --query 'SELECT 1'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  qdata-api:
+    image: python:3.12-slim
+    container_name: qdata-api
+    profiles:
+      - app
+    working_dir: /app
+    environment:
+      QDATA_API_BACKEND: sql
+      QDATA_POSTGRES_DSN: postgresql://qdata:qdata@postgres:5432/qdata
+      QDATA_CLICKHOUSE_DSN: http://qdata:qdata@clickhouse:8123/default
+      QDATA_API_TOKENS: devtoken,smoketoken
+      QDATA_API_TOKEN_SCOPES: read,admin
+      QDATA_ALPHA2_HMAC_SECRET: ${QDATA_ALPHA2_HMAC_SECRET:-alpha2-local-secret}
+      QDATA_GAMMA2_HMAC_SECRET_CURRENT: ${QDATA_GAMMA2_HMAC_SECRET_CURRENT:-gamma2-current-secret}
+      QDATA_GAMMA2_HMAC_SECRET_NEXT: ${QDATA_GAMMA2_HMAC_SECRET_NEXT:-gamma2-next-secret}
+      QDATA_DELTA2_WECOM_WEBHOOK_URL: ${QDATA_DELTA2_WECOM_WEBHOOK_URL:-}
+      QDATA_DELTA6_WECOM_CALLBACK_SECRET: ${QDATA_DELTA6_WECOM_CALLBACK_SECRET:-delta6-local-secret}
+      QDATA_ZETA6_WECOM_CALLBACK_SECRET_NEXT: ${QDATA_ZETA6_WECOM_CALLBACK_SECRET_NEXT:-}
+      QDATA_VENDOR_SOURCE_CODE: ${QDATA_VENDOR_SOURCE_CODE:-vendor_http}
+      QDATA_VENDOR_BASE_URL: ${QDATA_VENDOR_BASE_URL:-}
+      QDATA_VENDOR_DAILY_PATH: ${QDATA_VENDOR_DAILY_PATH:-/daily}
+      QDATA_VENDOR_TOKEN: ${QDATA_VENDOR_TOKEN:-}
+      QDATA_VENDOR_AUTH_MODE: ${QDATA_VENDOR_AUTH_MODE:-bearer}
+      QDATA_VENDOR_API_KEY_HEADER: ${QDATA_VENDOR_API_KEY_HEADER:-X-API-Key}
+      QDATA_VENDOR_QUERY_TOKEN_PARAM: ${QDATA_VENDOR_QUERY_TOKEN_PARAM:-token}
+      QDATA_VENDOR_RATE_LIMIT_PER_MIN: ${QDATA_VENDOR_RATE_LIMIT_PER_MIN:-120}
+      QDATA_VENDOR_RETRY_LIMIT: ${QDATA_VENDOR_RETRY_LIMIT:-2}
+      QDATA_VENDOR_RETRY_SLEEP_SECONDS: ${QDATA_VENDOR_RETRY_SLEEP_SECONDS:-0.5}
+      QDATA_VENDOR_TIMEOUT_SECONDS: ${QDATA_VENDOR_TIMEOUT_SECONDS:-30}
+      QDATA_VENDOR_RESPONSE_ROWS_KEY: ${QDATA_VENDOR_RESPONSE_ROWS_KEY:-data}
+      QDATA_ETA6_ENVIRONMENT: ${QDATA_ETA6_ENVIRONMENT:-local}
+      QDATA_ETA6_CLOSURE_SCOPE: ${QDATA_ETA6_CLOSURE_SCOPE:-production_primary}
+      QDATA_ETA6_CLOSURE_MODE: ${QDATA_ETA6_CLOSURE_MODE:-review_only}
+      QDATA_ETA6_REQUIRE_REAL_VENDOR_ENV: ${QDATA_ETA6_REQUIRE_REAL_VENDOR_ENV:-true}
+      QDATA_ETA6_EXTERNAL_PROBE_ALLOWED: ${QDATA_ETA6_EXTERNAL_PROBE_ALLOWED:-false}
+      QDATA_ETA6_MIN_STABILITY_SCORE: ${QDATA_ETA6_MIN_STABILITY_SCORE:-70}
+      QDATA_ETA6_ALLOW_COST_WATCH: ${QDATA_ETA6_ALLOW_COST_WATCH:-false}
+      QDATA_LAMBDA5_FREE_SOURCE_LOOKBACK_HOURS: ${QDATA_LAMBDA5_FREE_SOURCE_LOOKBACK_HOURS:-72}
+      QDATA_LAMBDA5_FREE_SOURCE_MAX_ACTIONS: ${QDATA_LAMBDA5_FREE_SOURCE_MAX_ACTIONS:-50}
+      QDATA_LAMBDA5_FREE_SOURCE_MIN_RETRY_SCORE: ${QDATA_LAMBDA5_FREE_SOURCE_MIN_RETRY_SCORE:-75}
+      QDATA_MU5_FREE_SOURCE_MAX_ACTIONS: ${QDATA_MU5_FREE_SOURCE_MAX_ACTIONS:-20}
+      QDATA_MU5_FREE_SOURCE_CANARY_START_DATE: ${QDATA_MU5_FREE_SOURCE_CANARY_START_DATE:-2024-01-04}
+      QDATA_MU5_FREE_SOURCE_CANARY_END_DATE: ${QDATA_MU5_FREE_SOURCE_CANARY_END_DATE:-2024-01-04}
+      QDATA_MU5_ALLOW_WECOM_EXTERNAL: ${QDATA_MU5_ALLOW_WECOM_EXTERNAL:-false}
+      QDATA_MU5_BAOSTOCK_TIMEOUT_SECONDS: ${QDATA_MU5_BAOSTOCK_TIMEOUT_SECONDS:-3}
+      QDATA_NU5_FREE_SOURCE_LOOKBACK_HOURS: ${QDATA_NU5_FREE_SOURCE_LOOKBACK_HOURS:-24}
+      QDATA_NU5_FREE_SOURCE_APPROVAL_SLA_HOURS: ${QDATA_NU5_FREE_SOURCE_APPROVAL_SLA_HOURS:-4}
+      QDATA_NU5_FREE_SOURCE_MAX_BACKLOG_ACTIONS: ${QDATA_NU5_FREE_SOURCE_MAX_BACKLOG_ACTIONS:-50}
+      QDATA_NU5_FREE_SOURCE_MAX_FAILURE_RATE: ${QDATA_NU5_FREE_SOURCE_MAX_FAILURE_RATE:-0.5}
+      QDATA_NU5_FREE_SOURCE_MAX_STALE_MINUTES: ${QDATA_NU5_FREE_SOURCE_MAX_STALE_MINUTES:-90}
+      QDATA_XI5_FREE_SOURCE_LOOKBACK_DAYS: ${QDATA_XI5_FREE_SOURCE_LOOKBACK_DAYS:-30}
+      QDATA_XI5_FREE_SOURCE_MIN_VALIDATOR_SCORE: ${QDATA_XI5_FREE_SOURCE_MIN_VALIDATOR_SCORE:-55}
+      QDATA_XI5_FREE_SOURCE_MIN_BACKUP_SCORE: ${QDATA_XI5_FREE_SOURCE_MIN_BACKUP_SCORE:-75}
+      QDATA_XI5_FREE_SOURCE_MIN_PRIMARY_SCORE: ${QDATA_XI5_FREE_SOURCE_MIN_PRIMARY_SCORE:-90}
+      QDATA_XI5_FREE_SOURCE_MIN_COVERAGE_RATE: ${QDATA_XI5_FREE_SOURCE_MIN_COVERAGE_RATE:-0.95}
+      QDATA_XI5_FREE_SOURCE_MAX_CONFLICT_RATE_BPS: ${QDATA_XI5_FREE_SOURCE_MAX_CONFLICT_RATE_BPS:-5}
+      QDATA_OMICRON5_MIN_SLA_UPTIME_PCT: ${QDATA_OMICRON5_MIN_SLA_UPTIME_PCT:-99.5}
+      QDATA_OMICRON5_MIN_RATE_LIMIT_PER_MIN: ${QDATA_OMICRON5_MIN_RATE_LIMIT_PER_MIN:-60}
+      QDATA_OMICRON5_REQUIRE_LIVE_EVIDENCE: ${QDATA_OMICRON5_REQUIRE_LIVE_EVIDENCE:-false}
+      QDATA_PI5_PROMOTION_SCOPE: ${QDATA_PI5_PROMOTION_SCOPE:-full_market}
+      QDATA_PI5_REQUIRE_FULL_MARKET: ${QDATA_PI5_REQUIRE_FULL_MARKET:-true}
+      QDATA_PI5_REQUIRE_SIGNOFF: ${QDATA_PI5_REQUIRE_SIGNOFF:-true}
+      QDATA_PI5_APPLY_ROUTING: ${QDATA_PI5_APPLY_ROUTING:-false}
+      QDATA_PI5_TARGET_PRIORITY: ${QDATA_PI5_TARGET_PRIORITY:-0}
+      QDATA_RHO5_MONITOR_SCOPE: ${QDATA_RHO5_MONITOR_SCOPE:-post_promotion}
+      QDATA_RHO5_REQUIRE_APPLIED_PROMOTION: ${QDATA_RHO5_REQUIRE_APPLIED_PROMOTION:-true}
+      QDATA_RHO5_APPLY_ROLLBACK: ${QDATA_RHO5_APPLY_ROLLBACK:-false}
+      QDATA_RHO5_SHADOW_WINDOW_HOURS: ${QDATA_RHO5_SHADOW_WINDOW_HOURS:-24}
+      QDATA_RHO5_MAX_CONFLICT_RATE_BPS: ${QDATA_RHO5_MAX_CONFLICT_RATE_BPS:-5}
+      QDATA_RHO5_MAX_FAILURE_RATE: ${QDATA_RHO5_MAX_FAILURE_RATE:-0.01}
+      QDATA_RHO5_MAX_STALE_MINUTES: ${QDATA_RHO5_MAX_STALE_MINUTES:-90}
+      QDATA_SIGMA5_MONITOR_SCOPE: ${QDATA_SIGMA5_MONITOR_SCOPE:-primary_source}
+      QDATA_SIGMA5_LOOKBACK_HOURS: ${QDATA_SIGMA5_LOOKBACK_HOURS:-24}
+      QDATA_SIGMA5_CAPACITY_WINDOW_DAYS: ${QDATA_SIGMA5_CAPACITY_WINDOW_DAYS:-7}
+      QDATA_SIGMA5_MIN_SUCCESS_RATE: ${QDATA_SIGMA5_MIN_SUCCESS_RATE:-0.995}
+      QDATA_SIGMA5_MAX_ERROR_RATE: ${QDATA_SIGMA5_MAX_ERROR_RATE:-0.005}
+      QDATA_SIGMA5_MAX_LATENCY_P95_MS: ${QDATA_SIGMA5_MAX_LATENCY_P95_MS:-2000}
+      QDATA_SIGMA5_MAX_TIMEOUT_RATE: ${QDATA_SIGMA5_MAX_TIMEOUT_RATE:-0.01}
+      QDATA_SIGMA5_MAX_COST_UNITS: ${QDATA_SIGMA5_MAX_COST_UNITS:-500}
+      QDATA_SIGMA5_MAX_SCHEDULER_LAG_MINUTES: ${QDATA_SIGMA5_MAX_SCHEDULER_LAG_MINUTES:-90}
+      QDATA_SIGMA5_MAX_BACKLOG_COUNT: ${QDATA_SIGMA5_MAX_BACKLOG_COUNT:-50}
+      QDATA_SIGMA5_MAX_POST_PROMOTION_NO_APPLIED_COUNT: ${QDATA_SIGMA5_MAX_POST_PROMOTION_NO_APPLIED_COUNT:-0}
+      PIP_INDEX_URL: ${QDATA_PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      TZ: Asia/Shanghai
+    ports:
+      - "18080:18080"
+    volumes:
+      - ./:/app:ro
+    command: >
+      sh -lc "python -m pip install --no-cache-dir --target /tmp/qdata-deps 'psycopg[binary]>=3.1' 'clickhouse-connect>=0.7' >/tmp/qdata-api-pip.log
+      && PYTHONPATH=/tmp/qdata-deps:/app python scripts/run_api_server.py --host 0.0.0.0 --port 18080 --backend sql"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "PYTHONPATH=/tmp/qdata-deps:/app python -c \"from urllib.request import urlopen; urlopen('http://127.0.0.1:18080/health', timeout=5).read()\""]
+      interval: 10s
+      timeout: 6s
+      retries: 12
+    restart: unless-stopped
+
+  mu-scheduler:
+    image: python:3.12-slim
+    container_name: qdata-mu-scheduler
+    profiles:
+      - scheduler
+    working_dir: /app
+    environment:
+      QDATA_POSTGRES_DSN: postgresql://qdata:qdata@postgres:5432/qdata
+      QDATA_MU_POLL_SECONDS: "30"
+      QDATA_ALPHA2_HMAC_SECRET: ${QDATA_ALPHA2_HMAC_SECRET:-alpha2-local-secret}
+      QDATA_GAMMA2_HMAC_SECRET_CURRENT: ${QDATA_GAMMA2_HMAC_SECRET_CURRENT:-gamma2-current-secret}
+      QDATA_GAMMA2_HMAC_SECRET_NEXT: ${QDATA_GAMMA2_HMAC_SECRET_NEXT:-gamma2-next-secret}
+      QDATA_DELTA2_WECOM_WEBHOOK_URL: ${QDATA_DELTA2_WECOM_WEBHOOK_URL:-}
+      QDATA_VENDOR_SOURCE_CODE: ${QDATA_VENDOR_SOURCE_CODE:-vendor_http}
+      QDATA_VENDOR_BASE_URL: ${QDATA_VENDOR_BASE_URL:-}
+      QDATA_VENDOR_DAILY_PATH: ${QDATA_VENDOR_DAILY_PATH:-/daily}
+      QDATA_VENDOR_TOKEN: ${QDATA_VENDOR_TOKEN:-}
+      QDATA_VENDOR_AUTH_MODE: ${QDATA_VENDOR_AUTH_MODE:-bearer}
+      QDATA_VENDOR_API_KEY_HEADER: ${QDATA_VENDOR_API_KEY_HEADER:-X-API-Key}
+      QDATA_VENDOR_QUERY_TOKEN_PARAM: ${QDATA_VENDOR_QUERY_TOKEN_PARAM:-token}
+      QDATA_VENDOR_RATE_LIMIT_PER_MIN: ${QDATA_VENDOR_RATE_LIMIT_PER_MIN:-120}
+      QDATA_VENDOR_RETRY_LIMIT: ${QDATA_VENDOR_RETRY_LIMIT:-2}
+      QDATA_VENDOR_RETRY_SLEEP_SECONDS: ${QDATA_VENDOR_RETRY_SLEEP_SECONDS:-0.5}
+      QDATA_VENDOR_TIMEOUT_SECONDS: ${QDATA_VENDOR_TIMEOUT_SECONDS:-30}
+      QDATA_VENDOR_RESPONSE_ROWS_KEY: ${QDATA_VENDOR_RESPONSE_ROWS_KEY:-data}
+      QDATA_ETA6_ENVIRONMENT: ${QDATA_ETA6_ENVIRONMENT:-local}
+      QDATA_ETA6_CLOSURE_SCOPE: ${QDATA_ETA6_CLOSURE_SCOPE:-production_primary}
+      QDATA_ETA6_CLOSURE_MODE: ${QDATA_ETA6_CLOSURE_MODE:-review_only}
+      QDATA_ETA6_REQUIRE_REAL_VENDOR_ENV: ${QDATA_ETA6_REQUIRE_REAL_VENDOR_ENV:-true}
+      QDATA_ETA6_EXTERNAL_PROBE_ALLOWED: ${QDATA_ETA6_EXTERNAL_PROBE_ALLOWED:-false}
+      QDATA_ETA6_MIN_STABILITY_SCORE: ${QDATA_ETA6_MIN_STABILITY_SCORE:-70}
+      QDATA_ETA6_ALLOW_COST_WATCH: ${QDATA_ETA6_ALLOW_COST_WATCH:-false}
+      QDATA_LAMBDA5_FREE_SOURCE_LOOKBACK_HOURS: ${QDATA_LAMBDA5_FREE_SOURCE_LOOKBACK_HOURS:-72}
+      QDATA_LAMBDA5_FREE_SOURCE_MAX_ACTIONS: ${QDATA_LAMBDA5_FREE_SOURCE_MAX_ACTIONS:-50}
+      QDATA_LAMBDA5_FREE_SOURCE_MIN_RETRY_SCORE: ${QDATA_LAMBDA5_FREE_SOURCE_MIN_RETRY_SCORE:-75}
+      QDATA_MU5_FREE_SOURCE_MAX_ACTIONS: ${QDATA_MU5_FREE_SOURCE_MAX_ACTIONS:-20}
+      QDATA_MU5_FREE_SOURCE_CANARY_START_DATE: ${QDATA_MU5_FREE_SOURCE_CANARY_START_DATE:-2024-01-04}
+      QDATA_MU5_FREE_SOURCE_CANARY_END_DATE: ${QDATA_MU5_FREE_SOURCE_CANARY_END_DATE:-2024-01-04}
+      QDATA_MU5_ALLOW_WECOM_EXTERNAL: ${QDATA_MU5_ALLOW_WECOM_EXTERNAL:-false}
+      QDATA_MU5_BAOSTOCK_TIMEOUT_SECONDS: ${QDATA_MU5_BAOSTOCK_TIMEOUT_SECONDS:-3}
+      QDATA_NU5_FREE_SOURCE_LOOKBACK_HOURS: ${QDATA_NU5_FREE_SOURCE_LOOKBACK_HOURS:-24}
+      QDATA_NU5_FREE_SOURCE_APPROVAL_SLA_HOURS: ${QDATA_NU5_FREE_SOURCE_APPROVAL_SLA_HOURS:-4}
+      QDATA_NU5_FREE_SOURCE_MAX_BACKLOG_ACTIONS: ${QDATA_NU5_FREE_SOURCE_MAX_BACKLOG_ACTIONS:-50}
+      QDATA_NU5_FREE_SOURCE_MAX_FAILURE_RATE: ${QDATA_NU5_FREE_SOURCE_MAX_FAILURE_RATE:-0.5}
+      QDATA_NU5_FREE_SOURCE_MAX_STALE_MINUTES: ${QDATA_NU5_FREE_SOURCE_MAX_STALE_MINUTES:-90}
+      QDATA_XI5_FREE_SOURCE_LOOKBACK_DAYS: ${QDATA_XI5_FREE_SOURCE_LOOKBACK_DAYS:-30}
+      QDATA_XI5_FREE_SOURCE_MIN_VALIDATOR_SCORE: ${QDATA_XI5_FREE_SOURCE_MIN_VALIDATOR_SCORE:-55}
+      QDATA_XI5_FREE_SOURCE_MIN_BACKUP_SCORE: ${QDATA_XI5_FREE_SOURCE_MIN_BACKUP_SCORE:-75}
+      QDATA_XI5_FREE_SOURCE_MIN_PRIMARY_SCORE: ${QDATA_XI5_FREE_SOURCE_MIN_PRIMARY_SCORE:-90}
+      QDATA_XI5_FREE_SOURCE_MIN_COVERAGE_RATE: ${QDATA_XI5_FREE_SOURCE_MIN_COVERAGE_RATE:-0.95}
+      QDATA_XI5_FREE_SOURCE_MAX_CONFLICT_RATE_BPS: ${QDATA_XI5_FREE_SOURCE_MAX_CONFLICT_RATE_BPS:-5}
+      QDATA_OMICRON5_MIN_SLA_UPTIME_PCT: ${QDATA_OMICRON5_MIN_SLA_UPTIME_PCT:-99.5}
+      QDATA_OMICRON5_MIN_RATE_LIMIT_PER_MIN: ${QDATA_OMICRON5_MIN_RATE_LIMIT_PER_MIN:-60}
+      QDATA_OMICRON5_REQUIRE_LIVE_EVIDENCE: ${QDATA_OMICRON5_REQUIRE_LIVE_EVIDENCE:-false}
+      QDATA_PI5_PROMOTION_SCOPE: ${QDATA_PI5_PROMOTION_SCOPE:-full_market}
+      QDATA_PI5_REQUIRE_FULL_MARKET: ${QDATA_PI5_REQUIRE_FULL_MARKET:-true}
+      QDATA_PI5_REQUIRE_SIGNOFF: ${QDATA_PI5_REQUIRE_SIGNOFF:-true}
+      QDATA_PI5_APPLY_ROUTING: ${QDATA_PI5_APPLY_ROUTING:-false}
+      QDATA_PI5_TARGET_PRIORITY: ${QDATA_PI5_TARGET_PRIORITY:-0}
+      QDATA_RHO5_MONITOR_SCOPE: ${QDATA_RHO5_MONITOR_SCOPE:-post_promotion}
+      QDATA_RHO5_REQUIRE_APPLIED_PROMOTION: ${QDATA_RHO5_REQUIRE_APPLIED_PROMOTION:-true}
+      QDATA_RHO5_APPLY_ROLLBACK: ${QDATA_RHO5_APPLY_ROLLBACK:-false}
+      QDATA_RHO5_SHADOW_WINDOW_HOURS: ${QDATA_RHO5_SHADOW_WINDOW_HOURS:-24}
+      QDATA_RHO5_MAX_CONFLICT_RATE_BPS: ${QDATA_RHO5_MAX_CONFLICT_RATE_BPS:-5}
+      QDATA_RHO5_MAX_FAILURE_RATE: ${QDATA_RHO5_MAX_FAILURE_RATE:-0.01}
+      QDATA_RHO5_MAX_STALE_MINUTES: ${QDATA_RHO5_MAX_STALE_MINUTES:-90}
+      QDATA_SIGMA5_MONITOR_SCOPE: ${QDATA_SIGMA5_MONITOR_SCOPE:-primary_source}
+      QDATA_SIGMA5_LOOKBACK_HOURS: ${QDATA_SIGMA5_LOOKBACK_HOURS:-24}
+      QDATA_SIGMA5_CAPACITY_WINDOW_DAYS: ${QDATA_SIGMA5_CAPACITY_WINDOW_DAYS:-7}
+      QDATA_SIGMA5_MIN_SUCCESS_RATE: ${QDATA_SIGMA5_MIN_SUCCESS_RATE:-0.995}
+      QDATA_SIGMA5_MAX_ERROR_RATE: ${QDATA_SIGMA5_MAX_ERROR_RATE:-0.005}
+      QDATA_SIGMA5_MAX_LATENCY_P95_MS: ${QDATA_SIGMA5_MAX_LATENCY_P95_MS:-2000}
+      QDATA_SIGMA5_MAX_TIMEOUT_RATE: ${QDATA_SIGMA5_MAX_TIMEOUT_RATE:-0.01}
+      QDATA_SIGMA5_MAX_COST_UNITS: ${QDATA_SIGMA5_MAX_COST_UNITS:-500}
+      QDATA_SIGMA5_MAX_SCHEDULER_LAG_MINUTES: ${QDATA_SIGMA5_MAX_SCHEDULER_LAG_MINUTES:-90}
+      QDATA_SIGMA5_MAX_BACKLOG_COUNT: ${QDATA_SIGMA5_MAX_BACKLOG_COUNT:-50}
+      QDATA_SIGMA5_MAX_POST_PROMOTION_NO_APPLIED_COUNT: ${QDATA_SIGMA5_MAX_POST_PROMOTION_NO_APPLIED_COUNT:-0}
+      PIP_INDEX_URL: ${QDATA_PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      TZ: Asia/Shanghai
+    volumes:
+      - ./:/app:ro
+    command: >
+      sh -lc "python -m pip install --no-cache-dir --target /tmp/qdata-deps 'psycopg[binary]>=3.1' >/tmp/qdata-mu-pip.log
+      && PYTHONPATH=/tmp/qdata-deps:/app python scripts/run_mu_scheduler.py --poll-seconds $${QDATA_MU_POLL_SECONDS}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  qdata-postgres-data:
+  qdata-clickhouse-data:

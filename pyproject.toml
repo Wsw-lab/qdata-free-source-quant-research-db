@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qdata"
+version = "0.1.0"
+description = "A-share quantitative financial data SDK prototype"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  { name = "Quant Data Platform" }
+]
+dependencies = []
+
+[project.optional-dependencies]
+dataframe = ["pandas>=2.0"]
+sql = ["psycopg[binary]>=3.1", "clickhouse-connect>=0.7"]
+akshare = ["akshare>=1.18.75; python_version >= '3.10'"]
+free-sources = ["baostock>=0.8.9", "tushare>=1.4.29"]
+api = []
+export = ["pandas>=2.0", "pyarrow>=15.0"]
+dev = ["pytest>=8.0", "pandas>=2.0", "pyarrow>=15.0", "psycopg[binary]>=3.1", "clickhouse-connect>=0.7"]
+
+[tool.setuptools.packages.find]
+include = ["qdata*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

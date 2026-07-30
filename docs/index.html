@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="QData is a zero-cost A-share quant research database project built with free-source adapters, data quality checks, PIT research modeling and admin observability.">
+  <title>QData Free Source Quant Research Database</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#top" aria-label="QData home">
+      <span class="brand-mark">QD</span>
+      <span>QData Research DB</span>
+    </a>
+    <nav class="nav" aria-label="Page sections">
+      <a href="#proof">Proof</a>
+      <a href="#system">System</a>
+      <a href="#sources">Sources</a>
+      <a href="#demo">Demo</a>
+    </nav>
+  </header>
+
+  <main id="top">
+    <section class="hero" aria-label="Project hero">
+      <div class="hero-inner">
+        <p class="eyebrow">Zero-cost quant data engineering project</p>
+        <h1>QData Free Source Quant Research Database</h1>
+        <p class="hero-copy">
+          An A-share research data platform that turns open-source and public financial data into an auditable quant research stack: ingestion, PIT modeling, source reliability, recovery workflows, and an admin console.
+        </p>
+        <div class="hero-actions">
+          <a class="button primary" href="#proof">View verification</a>
+          <a class="button" href="#system">Explore system</a>
+        </div>
+      </div>
+    </section>
+
+    <section id="proof" class="section band">
+      <div class="section-head">
+        <h2 class="section-title">Verified Engineering Signals</h2>
+        <p class="section-note">
+          The page is meant to be a concise technical project overview: fast to read, backed by command outputs, and honest about the free-source boundary.
+        </p>
+      </div>
+      <div class="metric-grid">
+        <div class="metric">
+          <strong>291</strong>
+          <span>unit tests passing across SDK, database, worker, API and console paths</span>
+        </div>
+        <div class="metric">
+          <strong>73</strong>
+          <span>Upsilon admin console smoke markers rendered from a local API server</span>
+        </div>
+        <div class="metric">
+          <strong>9</strong>
+          <span>free-source candidates tracked with reliability and admission metadata</span>
+        </div>
+        <div class="metric">
+          <strong>0 RMB</strong>
+          <span>current research route uses free/open/public sources, not paid production feeds</span>
+        </div>
+      </div>
+    </section>
+
+    <section id="system" class="section">
+      <div class="section-head">
+        <h2 class="section-title">How It Works</h2>
+        <p class="section-note">
+          QData is not just a scraper. It is a small research data platform with storage, quality gates, source governance, worker automation and REST/admin surfaces.
+        </p>
+      </div>
+      <div class="system-grid">
+        <div class="panel">
+          <h3>Research Pipeline</h3>
+          <div class="pipeline">
+            <div class="pipe-step">
+              <span class="number">1</span>
+              <div><b>Collect free-source data</b><span>AKShare, BaoStock, Tushare free tier, exchange pages, public announcements and local fixtures.</span></div>
+              <span class="status">ingest</span>
+            </div>
+            <div class="pipe-step">
+              <span class="number">2</span>
+              <div><b>Normalize into quant datasets</b><span>Daily bars, adjustment factors, trading calendar, index/industry data, PIT financials and events.</span></div>
+              <span class="status">model</span>
+            </div>
+            <div class="pipe-step">
+              <span class="number">3</span>
+              <div><b>Score reliability and admission</b><span>Coverage, conflict, freshness, license status, recovery backlog and route safety are audited.</span></div>
+              <span class="status watch">govern</span>
+            </div>
+            <div class="pipe-step">
+              <span class="number">4</span>
+              <div><b>Serve research workflows</b><span>Python SDK, PostgreSQL metadata, ClickHouse time series, REST API and Upsilon admin console.</span></div>
+              <span class="status">serve</span>
+            </div>
+          </div>
+        </div>
+        <div class="panel">
+          <h3>Local Verification</h3>
+          <div class="proof">
+            <b>Unit test suite</b>
+            <code>python3 -m unittest discover -s tests
+Ran 291 tests ... OK</code>
+          </div>
+          <div class="proof">
+            <b>Console smoke</b>
+            <code>python3 scripts/smoke_upsilon_console.py --base-url http://127.0.0.1:18080 --token devtoken
+upsilon_console=ok html_bytes=807462 markers=73</code>
+          </div>
+          <div class="proof">
+            <b>Core API smoke</b>
+            <code>health=ok rows=1
+price=ok rows=2
+constraints=ok rows=2
+tradable=ok rows=2
+matrix_csv=ok lines=2</code>
+          </div>
+        </div>
+      </div>
+      <div class="architecture-panel">
+        <h3>Architecture Diagram</h3>
+        <img src="assets/qdata-architecture.svg" alt="QData free-source quant research database architecture">
+      </div>
+    </section>
+
+    <section id="sources" class="section band">
+      <div class="section-head">
+        <h2 class="section-title">Free Source Strategy</h2>
+        <p class="section-note">
+          The project is deliberately framed as a research database. Free sources can be excellent for learning, validation and strategy research, while commercial production use needs separate authorization.
+        </p>
+      </div>
+      <div class="system-grid">
+        <div class="panel table-scroll">
+          <h3>Source Matrix</h3>
+          <table class="source-table">
+            <thead>
+              <tr>
+                <th>Source</th>
+                <th>Research Use</th>
+                <th>Governance Rule</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>AKShare</td>
+                <td>Daily bars, symbols, calendars and public market datasets</td>
+                <td>Research and validation first; upstream terms reviewed before commercial use</td>
+              </tr>
+              <tr>
+                <td>BaoStock</td>
+                <td>Historical A-share data and financial statement candidates</td>
+                <td>Socket timeout guard and recovery workflows protect long-running jobs</td>
+              </tr>
+              <tr>
+                <td>Tushare free tier</td>
+                <td>Free token or quota-limited supplementary checks</td>
+                <td>Token is optional and never committed; quota and terms are tracked</td>
+              </tr>
+              <tr>
+                <td>Official public pages</td>
+                <td>Exchange, announcement and macro public data candidates</td>
+                <td>Cache, attribution and redistribution questions remain explicit blockers</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="panel">
+          <h3>Why This Is a Strong Engineering Project</h3>
+          <div class="skills">
+            <div class="skill"><b>Data engineering</b><span>Schema design, migrations, PIT modeling, time-series storage and reproducible local Docker smoke tests.</span></div>
+            <div class="skill"><b>Quant research awareness</b><span>Trading calendars, adjusted prices, universe queries, factor values and future-function prevention.</span></div>
+            <div class="skill"><b>Reliability thinking</b><span>Multi-source comparison, coverage checks, conflict rates, automatic downgrade and recovery actions.</span></div>
+            <div class="skill"><b>Product communication</b><span>Clear documentation, admin console, API contract and an honest free-vs-production boundary.</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="demo" class="section">
+      <div class="story">
+        <div>
+          <h2 class="section-title">Project Narrative</h2>
+        </div>
+        <div>
+          <p>
+            This project shows how I think about data as infrastructure: not simply downloading market prices, but building a controlled research environment where every dataset has lineage, quality checks and source-risk evidence.
+          </p>
+          <p>
+            The current version intentionally focuses on a zero-cost research route. It documents software engineering choices, quantitative finance assumptions and independent project execution in a reproducible repository.
+          </p>
+          <p>
+            The next technical milestone is to publish more example notebooks: factor construction, PIT financial screening, event-study samples and a small backtest powered by the QData SDK.
+          </p>
+          <div class="hero-actions">
+            <a class="button primary" href="#system">Review architecture</a>
+            <a class="button" href="#sources">Check source strategy</a>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <span>QData Free Source Quant Research Database</span>
+      <a href="#top">Back to top</a>
+    </div>
+  </footer>
+</body>
+</html>

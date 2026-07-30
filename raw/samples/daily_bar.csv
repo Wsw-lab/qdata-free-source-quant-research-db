@@ -1,0 +1,3 @@
+symbol,trade_date,open,high,low,close,pre_close,volume,amount,vwap,turnover_rate,limit_up,limit_down,is_suspended,factor_forward,factor_backward,ex_right_type
+600519.SH,2024-01-04,1700.00,1720.00,1690.00,1715.00,1705.00,10000000,17100000000,1710.00,0.0108,1875.50,1534.50,false,0.532100000000,12.872300000000,none
+000001.SZ,2024-01-04,9.70,9.80,9.60,9.75,9.66,70000000,681100000,9.73,0.0036,10.63,8.69,false,1.123400000000,5.031200000000,none

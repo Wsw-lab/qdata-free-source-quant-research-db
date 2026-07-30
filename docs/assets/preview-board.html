@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QData Preview Board</title>
+  <style>
+    :root {
+      --ink: #17201d;
+      --muted: #5e6b65;
+      --line: #d7dfda;
+      --paper: #f4f7f2;
+      --panel: #ffffff;
+      --green: #2e7d57;
+      --teal: #247a83;
+      --gold: #b7791f;
+      --red: #b44d42;
+      --blue: #396a9f;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      width: 1440px;
+      height: 920px;
+      overflow: hidden;
+      color: var(--ink);
+      background: var(--paper);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .board {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      gap: 24px;
+      width: 100%;
+      height: 100%;
+      padding: 32px;
+      background:
+        linear-gradient(90deg, rgba(46, 125, 87, 0.08), transparent 48%),
+        radial-gradient(circle at 78% 18%, rgba(183, 121, 31, 0.16), transparent 32%),
+        var(--paper);
+    }
+
+    aside {
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.82);
+      border-radius: 8px;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      box-shadow: 0 18px 60px rgba(39, 51, 45, 0.10);
+    }
+
+    .brand {
+      font-size: 29px;
+      font-weight: 760;
+      letter-spacing: 0;
+      line-height: 1.05;
+    }
+
+    .label {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .nav {
+      display: grid;
+      gap: 10px;
+      margin-top: 32px;
+    }
+
+    .nav span {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px 14px;
+      background: #fbfcfa;
+      font-size: 14px;
+      font-weight: 650;
+    }
+
+    .nav span:first-child {
+      color: #fff;
+      border-color: var(--green);
+      background: var(--green);
+    }
+
+    main {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 20px;
+      min-width: 0;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      gap: 24px;
+    }
+
+    h1 {
+      max-width: 780px;
+      margin: 0;
+      font-size: 54px;
+      line-height: 1;
+      letter-spacing: 0;
+    }
+
+    .status {
+      display: grid;
+      grid-template-columns: repeat(3, 124px);
+      gap: 10px;
+    }
+
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.78);
+      padding: 13px 14px;
+    }
+
+    .metric strong {
+      display: block;
+      font-size: 28px;
+      line-height: 1;
+    }
+
+    .metric small {
+      display: block;
+      margin-top: 7px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.3;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1.08fr 0.92fr;
+      gap: 20px;
+      min-height: 0;
+    }
+
+    .panel {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.9);
+      padding: 22px;
+      box-shadow: 0 18px 60px rgba(39, 51, 45, 0.10);
+    }
+
+    .panel h2 {
+      margin: 0 0 16px;
+      font-size: 18px;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+
+    .pipeline {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 12px;
+      margin-bottom: 22px;
+    }
+
+    .step {
+      min-height: 122px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      background: #fbfcfa;
+    }
+
+    .step b {
+      display: block;
+      font-size: 13px;
+      color: var(--green);
+    }
+
+    .step span {
+      display: block;
+      margin-top: 10px;
+      font-size: 19px;
+      line-height: 1.15;
+      font-weight: 720;
+    }
+
+    .bars {
+      display: grid;
+      gap: 13px;
+    }
+
+    .bar {
+      display: grid;
+      grid-template-columns: 170px 1fr 56px;
+      align-items: center;
+      gap: 12px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .track {
+      height: 12px;
+      border-radius: 999px;
+      background: #e1e7e3;
+      overflow: hidden;
+    }
+
+    .fill {
+      height: 100%;
+      border-radius: inherit;
+      background: var(--green);
+    }
+
+    .fill.teal { background: var(--teal); }
+    .fill.gold { background: var(--gold); }
+    .fill.blue { background: var(--blue); }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 12px 10px;
+      text-align: left;
+      vertical-align: top;
+      line-height: 1.35;
+    }
+
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .tag {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 4px 8px;
+      color: #fff;
+      background: var(--green);
+      font-size: 11px;
+      font-weight: 720;
+    }
+
+    .tag.warn { background: var(--gold); }
+    .tag.info { background: var(--teal); }
+    .tag.block { background: var(--red); }
+
+    footer {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 14px;
+    }
+
+    .proof {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.86);
+      padding: 16px;
+    }
+
+    .proof strong {
+      display: block;
+      font-size: 22px;
+      line-height: 1;
+    }
+
+    .proof span {
+      display: block;
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+  </style>
+</head>
+<body>
+  <div class="board">
+    <aside>
+      <div>
+        <div class="brand">QData<br>Research DB</div>
+        <div class="label">Zero-cost A-share quant data platform with auditable source governance.</div>
+        <div class="nav">
+          <span>Free-source fabric</span>
+          <span>Reliability scoring</span>
+          <span>PIT research layer</span>
+          <span>Admin observability</span>
+        </div>
+      </div>
+      <div class="label">Project snapshot: 2026-07-30</div>
+    </aside>
+    <main>
+      <header>
+        <h1>Free-source quant research database for A-share strategy work.</h1>
+        <div class="status">
+          <div class="metric"><strong>291</strong><small>unit tests passing</small></div>
+          <div class="metric"><strong>73</strong><small>console smoke markers</small></div>
+          <div class="metric"><strong>9</strong><small>free source candidates</small></div>
+        </div>
+      </header>
+      <section class="grid">
+        <div class="panel">
+          <h2>Research Data Pipeline</h2>
+          <div class="pipeline">
+            <div class="step"><b>01</b><span>Collect</span><small>AKShare, BaoStock, Tushare free, official public pages</small></div>
+            <div class="step"><b>02</b><span>Normalize</span><small>Daily bars, calendars, PIT financials, events</small></div>
+            <div class="step"><b>03</b><span>Validate</span><small>Coverage, conflict, freshness, schema drift</small></div>
+            <div class="step"><b>04</b><span>Score</span><small>Reliability, admission, recovery health</small></div>
+            <div class="step"><b>05</b><span>Serve</span><small>Python SDK, SQL backend, admin console</small></div>
+          </div>
+          <div class="bars">
+            <div class="bar"><span>Daily market research</span><div class="track"><div class="fill" style="width: 92%"></div></div><b>92%</b></div>
+            <div class="bar"><span>Free-source governance</span><div class="track"><div class="fill teal" style="width: 88%"></div></div><b>88%</b></div>
+            <div class="bar"><span>Research readiness</span><div class="track"><div class="fill blue" style="width: 84%"></div></div><b>84%</b></div>
+            <div class="bar"><span>Commercial production</span><div class="track"><div class="fill gold" style="width: 38%"></div></div><b>38%</b></div>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>Source Governance Matrix</h2>
+          <table>
+            <thead>
+              <tr><th>Source</th><th>Role</th><th>Status</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>AKShare</td><td>Research / validator</td><td><span class="tag info">canary</span></td></tr>
+              <tr><td>BaoStock</td><td>Historical fallback</td><td><span class="tag warn">network guard</span></td></tr>
+              <tr><td>Tushare free</td><td>Quota-limited check</td><td><span class="tag warn">token optional</span></td></tr>
+              <tr><td>Official public</td><td>Announcement / exchange data</td><td><span class="tag info">review</span></td></tr>
+              <tr><td>Commercial primary</td><td>Future production source</td><td><span class="tag block">not required now</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <footer>
+        <div class="proof"><strong>PostgreSQL</strong><span>Versioned metadata, audit tables, worker schedules</span></div>
+        <div class="proof"><strong>ClickHouse</strong><span>Time-series storage for market data and factors</span></div>
+        <div class="proof"><strong>Python SDK</strong><span>Research-first API for price, PIT, universe and factors</span></div>
+        <div class="proof"><strong>Smoke tested</strong><span>API, console, migration and worker paths verified locally</span></div>
+      </footer>
+    </main>
+  </div>
+</body>
+</html>
