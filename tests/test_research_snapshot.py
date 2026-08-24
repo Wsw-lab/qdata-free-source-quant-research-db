@@ -13,6 +13,7 @@ from decimal import localcontext
 from pathlib import Path
 from unittest.mock import patch
 
+import qdata.research_snapshot as research_snapshot_module
 from examples.build_research_snapshot import (
     FIXTURE_CUTOFF_TS,
     FIXTURE_DATA_VERSION,
@@ -646,7 +647,7 @@ class ResearchSnapshotTest(unittest.TestCase):
             with self.assertRaisesRegex(SnapshotVerificationError, "hard link"):
                 verify_research_snapshot(root)
 
-    def test_publisher_preserves_concurrent_entry_and_cleans_only_owned_files(
+    def test_failed_publication_preserves_all_entries_and_refuses_rebuild(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -669,7 +670,73 @@ class ResearchSnapshotTest(unittest.TestCase):
             self.assertEqual(
                 (root / "fundamental_pit.csv").read_bytes(), intruder_payload
             )
-            self.assertFalse((root / "daily_bar.csv").exists())
+            daily_path = root / "daily_bar.csv"
+            self.assertTrue(
+                daily_path.exists(),
+                "a reserved destination must retain builder-created entries",
+            )
+            builder_payload = daily_path.read_bytes()
+            self.assertIn(b"symbol,trade_date", builder_payload)
+            self.assertFalse((root / "manifest.json").exists())
+
+            with self.assertRaisesRegex(
+                SnapshotVerificationError, "file set mismatch"
+            ):
+                verify_research_snapshot(root)
+            with self.assertRaisesRegex(SnapshotImmutableError, "unverifiable"):
+                self._build(root)
+
+            self.assertEqual(
+                (root / "fundamental_pit.csv").read_bytes(), intruder_payload
+            )
+            self.assertEqual(daily_path.read_bytes(), builder_payload)
+
+    def test_verify_rejects_same_inode_rewrite_with_restored_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "snapshot"
+            self._build(root)
+            daily_path = root / "daily_bar.csv"
+            original_payload = daily_path.read_bytes()
+            tampered_payload = original_payload.replace(b"1728", b"1729", 1)
+            self.assertNotEqual(tampered_payload, original_payload)
+            self.assertEqual(len(tampered_payload), len(original_payload))
+            original_stat = daily_path.stat()
+            original_validator = (
+                research_snapshot_module._validate_cross_dataset_contract
+            )
+            mutation_happened = False
+
+            def mutate_after_semantic_validation(rows_by_dataset):
+                nonlocal mutation_happened
+                original_validator(rows_by_dataset)
+                if mutation_happened:
+                    return
+                with daily_path.open("r+b") as handle:
+                    handle.write(tampered_payload)
+                    handle.truncate()
+                os.utime(
+                    daily_path,
+                    ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+                )
+                mutation_happened = True
+
+            with patch.object(
+                research_snapshot_module,
+                "_validate_cross_dataset_contract",
+                side_effect=mutate_after_semantic_validation,
+            ):
+                with self.assertRaisesRegex(
+                    SnapshotVerificationError, "changed during verification"
+                ):
+                    verify_research_snapshot(root)
+
+            tampered_stat = daily_path.stat()
+            self.assertTrue(mutation_happened)
+            self.assertEqual(tampered_stat.st_ino, original_stat.st_ino)
+            self.assertEqual(tampered_stat.st_size, original_stat.st_size)
+            self.assertEqual(tampered_stat.st_mtime_ns, original_stat.st_mtime_ns)
+            self.assertNotEqual(tampered_stat.st_ctime_ns, original_stat.st_ctime_ns)
+            self.assertEqual(daily_path.read_bytes(), tampered_payload)
 
     def test_fixture_manifest_labels_contract_demo_as_non_performance_evidence(
         self,

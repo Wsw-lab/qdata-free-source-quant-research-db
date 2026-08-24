@@ -313,23 +313,13 @@ def build_research_snapshot(
             f"{name}.csv": payload for name, payload in file_payloads.items()
         }
         publication_payloads[MANIFEST_FILENAME] = manifest_payload
-        try:
-            directory_identity, published_files = _publish_exclusive_files(
-                destination, publication_payloads
-            )
-        except SnapshotImmutableError:
-            raise
-        try:
-            # Verify the final directory independently. Staging verification
-            # cannot prove that publication preserved file identities.
-            return verify_research_snapshot(destination)
-        except Exception:
-            _cleanup_owned_files(
-                destination,
-                directory_identity=directory_identity,
-                owned_files=published_files,
-            )
-            raise
+        _publish_exclusive_files(destination, publication_payloads)
+        # Verify the final directory independently. Staging verification cannot
+        # prove that publication preserved file identities. Once the final
+        # directory has been reserved, failures deliberately leave every entry
+        # untouched for operator inspection; a future build refuses to replace
+        # the incomplete directory.
+        return verify_research_snapshot(destination)
     finally:
         if staging.exists():
             shutil.rmtree(staging)
@@ -342,8 +332,9 @@ def verify_research_snapshot(
 
     root = Path(snapshot_dir)
     directory_fd, directory_identity = _open_regular_directory(root)
+    file_fds: dict[str, int] = {}
     try:
-        payloads, file_identities = _read_snapshot_payloads(directory_fd)
+        payloads, file_fds, file_identities = _read_snapshot_payloads(directory_fd)
         manifest_payload = payloads[MANIFEST_FILENAME]
         try:
             manifest = json.loads(manifest_payload.decode("utf-8"))
@@ -453,19 +444,23 @@ def verify_research_snapshot(
                 "snapshot_id does not match manifest content"
             )
 
-        _recheck_snapshot_identities(
+        _recheck_snapshot_contents(
             root,
             directory_fd,
             directory_identity=directory_identity,
+            file_fds=file_fds,
             file_identities=file_identities,
+            initial_payloads=payloads,
         )
         return manifest
     finally:
+        for file_fd in file_fds.values():
+            os.close(file_fd)
         os.close(directory_fd)
 
 
-_DirectoryIdentity = tuple[int, int]
-_FileIdentity = tuple[int, int, int, int]
+_DirectoryIdentity = tuple[int, int, int, int]
+_FileIdentity = tuple[int, int, int, int, int]
 
 
 def _open_regular_directory(path: Path) -> tuple[int, _DirectoryIdentity]:
@@ -487,12 +482,12 @@ def _open_regular_directory(path: Path) -> tuple[int, _DirectoryIdentity]:
         raise SnapshotVerificationError(
             f"snapshot path is not a regular directory: {path}"
         )
-    return directory_fd, (metadata.st_dev, metadata.st_ino)
+    return directory_fd, _directory_identity(metadata)
 
 
 def _read_snapshot_payloads(
     directory_fd: int,
-) -> tuple[dict[str, bytes], dict[str, _FileIdentity]]:
+) -> tuple[dict[str, bytes], dict[str, int], dict[str, _FileIdentity]]:
     expected_names = _expected_snapshot_filenames()
     try:
         actual_names = set(os.listdir(directory_fd))
@@ -506,18 +501,27 @@ def _read_snapshot_payloads(
         )
 
     payloads: dict[str, bytes] = {}
+    file_fds: dict[str, int] = {}
     identities: dict[str, _FileIdentity] = {}
-    for filename in sorted(expected_names):
-        payload, identity = _read_regular_file_at(directory_fd, filename)
-        payloads[filename] = payload
-        identities[filename] = identity
-    return payloads, identities
+    try:
+        for filename in sorted(expected_names):
+            file_fd, payload, identity = _open_and_read_regular_file_at(
+                directory_fd, filename
+            )
+            file_fds[filename] = file_fd
+            payloads[filename] = payload
+            identities[filename] = identity
+        return payloads, file_fds, identities
+    except BaseException:
+        for file_fd in file_fds.values():
+            os.close(file_fd)
+        raise
 
 
-def _read_regular_file_at(
+def _open_and_read_regular_file_at(
     directory_fd: int,
     filename: str,
-) -> tuple[bytes, _FileIdentity]:
+) -> tuple[int, bytes, _FileIdentity]:
     flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     try:
         file_fd = os.open(filename, flags, dir_fd=directory_fd)
@@ -543,9 +547,10 @@ def _read_regular_file_at(
             raise SnapshotVerificationError(
                 f"{filename} changed while it was being read"
             )
-        return payload, after_identity
-    finally:
+        return file_fd, payload, after_identity
+    except BaseException:
         os.close(file_fd)
+        raise
 
 
 def _validate_open_file_metadata(filename: str, metadata: os.stat_result) -> None:
@@ -561,25 +566,127 @@ def _file_identity(metadata: os.stat_result) -> _FileIdentity:
         metadata.st_ino,
         metadata.st_size,
         metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
     )
 
 
-def _recheck_snapshot_identities(
+def _directory_identity(metadata: os.stat_result) -> _DirectoryIdentity:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _recheck_snapshot_contents(
     root: Path,
     directory_fd: int,
     *,
     directory_identity: _DirectoryIdentity,
+    file_fds: Mapping[str, int],
     file_identities: Mapping[str, _FileIdentity],
+    initial_payloads: Mapping[str, bytes],
+) -> None:
+    _recheck_directory_state(
+        root,
+        directory_fd,
+        directory_identity=directory_identity,
+        expected_names=set(file_identities),
+    )
+    if set(file_fds) != set(file_identities) or set(initial_payloads) != set(
+        file_identities
+    ):
+        raise SnapshotVerificationError(
+            "snapshot file handles changed during verification"
+        )
+
+    for filename in sorted(file_identities):
+        expected_identity = file_identities[filename]
+        file_fd = file_fds[filename]
+        try:
+            before = os.fstat(file_fd)
+            _validate_open_file_metadata(filename, before)
+            final_digest, final_size = _hash_open_file(file_fd)
+            after = os.fstat(file_fd)
+            _validate_open_file_metadata(filename, after)
+        except OSError as exc:
+            raise SnapshotVerificationError(
+                f"{filename} changed during verification"
+            ) from exc
+        if (
+            _file_identity(before) != expected_identity
+            or _file_identity(after) != expected_identity
+            or final_size != expected_identity[2]
+            or final_digest != _sha256(initial_payloads[filename])
+        ):
+            raise SnapshotVerificationError(
+                f"{filename} changed during verification"
+            )
+        _recheck_directory_entry(
+            directory_fd,
+            filename=filename,
+            expected_identity=expected_identity,
+        )
+
+    _recheck_directory_state(
+        root,
+        directory_fd,
+        directory_identity=directory_identity,
+        expected_names=set(file_identities),
+    )
+    for filename in sorted(file_identities):
+        expected_identity = file_identities[filename]
+        try:
+            metadata = os.fstat(file_fds[filename])
+            _validate_open_file_metadata(filename, metadata)
+        except OSError as exc:
+            raise SnapshotVerificationError(
+                f"{filename} changed during verification"
+            ) from exc
+        if _file_identity(metadata) != expected_identity:
+            raise SnapshotVerificationError(
+                f"{filename} changed during verification"
+            )
+        _recheck_directory_entry(
+            directory_fd,
+            filename=filename,
+            expected_identity=expected_identity,
+        )
+
+
+def _hash_open_file(file_fd: int) -> tuple[str, int]:
+    os.lseek(file_fd, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    total_size = 0
+    while True:
+        chunk = os.read(file_fd, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+        total_size += len(chunk)
+    return digest.hexdigest(), total_size
+
+
+def _recheck_directory_state(
+    root: Path,
+    directory_fd: int,
+    *,
+    directory_identity: _DirectoryIdentity,
+    expected_names: set[str],
 ) -> None:
     try:
         root_metadata = os.stat(root, follow_symlinks=False)
+        open_metadata = os.fstat(directory_fd)
     except OSError as exc:
         raise SnapshotVerificationError(
             "snapshot directory changed during verification"
         ) from exc
     if (
         not stat.S_ISDIR(root_metadata.st_mode)
-        or (root_metadata.st_dev, root_metadata.st_ino) != directory_identity
+        or not stat.S_ISDIR(open_metadata.st_mode)
+        or _directory_identity(root_metadata) != directory_identity
+        or _directory_identity(open_metadata) != directory_identity
     ):
         raise SnapshotVerificationError(
             "snapshot directory changed during verification"
@@ -590,45 +697,51 @@ def _recheck_snapshot_identities(
         raise SnapshotVerificationError(
             "snapshot directory changed during verification"
         ) from exc
-    if current_names != set(file_identities):
+    if current_names != expected_names:
         raise SnapshotVerificationError(
             "snapshot file set changed during verification"
         )
-    for filename, expected_identity in file_identities.items():
-        try:
-            metadata = os.stat(
-                filename,
-                dir_fd=directory_fd,
-                follow_symlinks=False,
-            )
-        except OSError as exc:
-            raise SnapshotVerificationError(
-                f"{filename} changed during verification"
-            ) from exc
-        _validate_open_file_metadata(filename, metadata)
-        if _file_identity(metadata) != expected_identity:
-            raise SnapshotVerificationError(
-                f"{filename} changed during verification"
-            )
+
+
+def _recheck_directory_entry(
+    directory_fd: int,
+    *,
+    filename: str,
+    expected_identity: _FileIdentity,
+) -> None:
+    try:
+        metadata = os.stat(
+            filename,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise SnapshotVerificationError(
+            f"{filename} changed during verification"
+        ) from exc
+    _validate_open_file_metadata(filename, metadata)
+    if _file_identity(metadata) != expected_identity:
+        raise SnapshotVerificationError(
+            f"{filename} changed during verification"
+        )
 
 
 def _publish_exclusive_files(
     destination: Path,
     payloads: Mapping[str, bytes],
-) -> tuple[_DirectoryIdentity, dict[str, _FileIdentity]]:
+) -> None:
     try:
-        directory_fd, directory_identity = _open_regular_directory(destination)
+        directory_fd, _ = _open_regular_directory(destination)
     except SnapshotVerificationError as exc:
         raise SnapshotImmutableError(
             f"cannot securely publish snapshot at {destination}"
         ) from exc
-    owned_files: dict[str, _FileIdentity] = {}
     ordered_names = sorted(name for name in payloads if name != MANIFEST_FILENAME)
     ordered_names.append(MANIFEST_FILENAME)
     try:
         for filename in ordered_names:
             try:
-                owned_files[filename] = _create_exclusive_file_at(
+                _create_exclusive_file_at(
                     directory_fd,
                     filename,
                     payloads[filename],
@@ -638,10 +751,6 @@ def _publish_exclusive_files(
                     f"concurrent entry already exists: {filename}"
                 ) from exc
         os.fsync(directory_fd)
-        return directory_identity, owned_files
-    except Exception:
-        _cleanup_owned_entries_at(directory_fd, owned_files)
-        raise
     finally:
         os.close(directory_fd)
 
@@ -650,14 +759,12 @@ def _create_exclusive_file_at(
     directory_fd: int,
     filename: str,
     payload: bytes,
-) -> _FileIdentity:
+) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
     flags |= getattr(os, "O_CLOEXEC", 0)
     file_fd = os.open(filename, flags, 0o644, dir_fd=directory_fd)
-    created_inode: tuple[int, int] | None = None
     try:
         created = os.fstat(file_fd)
-        created_inode = (created.st_dev, created.st_ino)
         if not stat.S_ISREG(created.st_mode) or created.st_nlink != 1:
             raise SnapshotImmutableError(
                 f"exclusive publication did not create a private regular file: {filename}"
@@ -672,67 +779,8 @@ def _create_exclusive_file_at(
             raise SnapshotImmutableError(
                 f"published byte count mismatch for {filename}"
             )
-        return _file_identity(metadata)
-    except Exception:
-        if created_inode is not None:
-            _unlink_if_inode_matches(
-                directory_fd,
-                filename,
-                created_inode,
-            )
-        raise
     finally:
         os.close(file_fd)
-
-
-def _cleanup_owned_entries_at(
-    directory_fd: int,
-    owned_files: Mapping[str, _FileIdentity],
-) -> None:
-    for filename, identity in reversed(tuple(owned_files.items())):
-        _unlink_if_inode_matches(
-            directory_fd,
-            filename,
-            (identity[0], identity[1]),
-        )
-
-
-def _unlink_if_inode_matches(
-    directory_fd: int,
-    filename: str,
-    expected_inode: tuple[int, int],
-) -> None:
-    try:
-        metadata = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
-    except OSError:
-        return
-    if (metadata.st_dev, metadata.st_ino) != expected_inode:
-        return
-    try:
-        os.unlink(filename, dir_fd=directory_fd)
-    except OSError:
-        return
-
-
-def _cleanup_owned_files(
-    destination: Path,
-    *,
-    directory_identity: _DirectoryIdentity,
-    owned_files: Mapping[str, _FileIdentity],
-) -> None:
-    try:
-        directory_fd, current_identity = _open_regular_directory(destination)
-    except SnapshotVerificationError:
-        return
-    try:
-        if current_identity == directory_identity:
-            _cleanup_owned_entries_at(directory_fd, owned_files)
-            try:
-                os.fsync(directory_fd)
-            except OSError:
-                pass
-    finally:
-        os.close(directory_fd)
 
 
 def _canonicalize_datasets(
