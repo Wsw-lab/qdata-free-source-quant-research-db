@@ -10,60 +10,66 @@ from qdata import Client
 
 
 SIGNAL_DATE = "2024-01-02"
-EXECUTION_DATE = "2024-01-03"
-EXIT_DATE = "2024-01-03"
+REFERENCE_DATE = "2024-01-03"
 UNIVERSE = "hs300"
 FACTOR = "momentum_20d"
 
 
 def run_demo() -> dict[str, Any]:
-    """Run a deterministic next-session factor arithmetic example.
+    """Run deterministic next-session adjusted reference arithmetic.
 
     The factor is treated as an after-close signal on ``SIGNAL_DATE``. The
-    example enters at the next session's open and marks at that session's close.
-    It demonstrates API alignment, not evidence for a trading strategy.
+    next session's forward-adjusted open and close are reference values only.
+    No order, execution, next-session tradability check, or backtest is modeled.
     """
     client = Client(default_format="records")
     research_rows = build_research_rows(client)
     if len(research_rows) < 2:
-        raise RuntimeError("the demo needs at least two tradable symbols")
+        raise RuntimeError("the demo needs at least two signal-universe symbols")
 
     ranked = sorted(research_rows, key=lambda row: row[FACTOR], reverse=True)
-    long_bucket = [ranked[0]]
-    short_bucket = [ranked[-1]]
-    benchmark_return = average(row["next_return"] for row in ranked)
-    long_return = average(row["next_return"] for row in long_bucket)
-    short_return = average(row["next_return"] for row in short_bucket)
+    highest_factor_group = [ranked[0]]
+    lowest_factor_group = [ranked[-1]]
+    universe_mean_marked_change = average(row["marked_change"] for row in ranked)
+    highest_factor_marked_change = average(
+        row["marked_change"] for row in highest_factor_group
+    )
+    lowest_factor_marked_change = average(
+        row["marked_change"] for row in lowest_factor_group
+    )
 
     return {
         "universe": UNIVERSE,
         "factor": FACTOR,
         "signal_date": SIGNAL_DATE,
-        "execution_date": EXECUTION_DATE,
-        "exit_date": EXIT_DATE,
+        "reference_date": REFERENCE_DATE,
         "signal_timing": "after_close",
-        "fill_timing": "next_session_open",
-        "mark_timing": "next_session_close",
-        "tradable_symbol_count": len(ranked),
-        "long_symbols": [row["symbol"] for row in long_bucket],
-        "short_symbols": [row["symbol"] for row in short_bucket],
-        "long_return": long_return,
-        "short_return": short_return,
-        "benchmark_return": benchmark_return,
-        "active_return": long_return - benchmark_return,
-        "factor_spread": long_return - short_return,
+        "reference_timing": "next_session_forward_adjusted_open_to_close",
+        "next_session_tradability_verified": False,
+        "signal_universe_symbol_count": len(ranked),
+        "highest_factor_symbols": [row["symbol"] for row in highest_factor_group],
+        "lowest_factor_symbols": [row["symbol"] for row in lowest_factor_group],
+        "highest_factor_marked_change": highest_factor_marked_change,
+        "lowest_factor_marked_change": lowest_factor_marked_change,
+        "universe_mean_marked_change": universe_mean_marked_change,
+        "highest_minus_universe_marked_change": (
+            highest_factor_marked_change - universe_mean_marked_change
+        ),
+        "highest_minus_lowest_marked_change": (
+            highest_factor_marked_change - lowest_factor_marked_change
+        ),
         "research_rows": ranked,
     }
 
 
 def build_research_rows(client: Client) -> list[dict[str, Any]]:
-    tradable = client.get_tradable_universe(
+    signal_universe = client.get_tradable_universe(
         asof_date=SIGNAL_DATE,
         universe=UNIVERSE,
         min_list_days=120,
         output_format="records",
     )
-    symbols = [row["symbol"] for row in tradable]
+    symbols = [row["symbol"] for row in signal_universe]
     factors = client.get_factor(
         factors=[FACTOR, "roe_ttm"],
         symbols=symbols,
@@ -75,7 +81,7 @@ def build_research_rows(client: Client) -> list[dict[str, Any]]:
     prices = client.get_price(
         symbols=symbols,
         start_date=SIGNAL_DATE,
-        end_date=EXIT_DATE,
+        end_date=REFERENCE_DATE,
         adjust="forward",
         fields=["open", "close"],
         output_format="records",
@@ -85,22 +91,24 @@ def build_research_rows(client: Client) -> list[dict[str, Any]]:
 
     rows: list[dict[str, Any]] = []
     for symbol in symbols:
-        execution_bar = price_by_symbol_date.get((symbol, EXECUTION_DATE))
+        reference_bar = price_by_symbol_date.get((symbol, REFERENCE_DATE))
         factor_row = factor_by_symbol.get(symbol)
-        if not execution_bar or not factor_row:
+        if not reference_bar or not factor_row:
             continue
-        entry_open = execution_bar.get("open")
-        exit_close = execution_bar.get("close")
-        if entry_open is None or exit_close is None:
+        adjusted_open_reference = reference_bar.get("open")
+        adjusted_close_mark = reference_bar.get("close")
+        if adjusted_open_reference is None or adjusted_close_mark is None:
             continue
         rows.append(
             {
                 "symbol": symbol,
-                "entry_open": entry_open,
-                "exit_close": exit_close,
+                "adjusted_open_reference": adjusted_open_reference,
+                "adjusted_close_mark": adjusted_close_mark,
                 FACTOR: factor_row[FACTOR],
                 "roe_ttm": factor_row["roe_ttm"],
-                "next_return": exit_close / entry_open - 1.0,
+                "marked_change": (
+                    adjusted_close_mark / adjusted_open_reference - 1.0
+                ),
             }
         )
     return rows
@@ -115,10 +123,11 @@ def format_report(result: dict[str, Any]) -> str:
     return "\n".join(
         [
             "QData factor API arithmetic demo",
-            f"universe={result['universe']} factor={result['factor']} signal_date={result['signal_date']} execution_date={result['execution_date']}",
-            f"signal_timing={result['signal_timing']} fill_timing={result['fill_timing']} mark_timing={result['mark_timing']}",
-            f"tradable_symbols={result['tradable_symbol_count']} long_bucket={','.join(result['long_symbols'])} short_bucket={','.join(result['short_symbols'])}",
-            f"long_return={pct(result['long_return'])} benchmark_return={pct(result['benchmark_return'])} active_return={pct(result['active_return'])} factor_spread={pct(result['factor_spread'])}",
+            f"universe={result['universe']} factor={result['factor']} signal_date={result['signal_date']} reference_date={result['reference_date']}",
+            f"signal_timing={result['signal_timing']} reference_timing={result['reference_timing']}",
+            f"signal_universe_symbols={result['signal_universe_symbol_count']} highest_factor={','.join(result['highest_factor_symbols'])} lowest_factor={','.join(result['lowest_factor_symbols'])}",
+            f"highest_factor_marked_change={pct(result['highest_factor_marked_change'])} universe_mean_marked_change={pct(result['universe_mean_marked_change'])} highest_minus_universe_marked_change={pct(result['highest_minus_universe_marked_change'])} highest_minus_lowest_marked_change={pct(result['highest_minus_lowest_marked_change'])}",
+            "next_session_tradability_verified=false adjusted_reference_only=true",
         ]
     )
 

@@ -2,7 +2,7 @@
 
 [中文](README.md) · [Immutable snapshot ADR](docs/adr/0001-research-snapshot-and-time-contract.md) · [Signal timing ADR](docs/adr/0002-after-close-signal-timing.md)
 
-QData is an A-share research data-engineering prototype. Its Python SDK, `research_snapshot_v1` contract, and factor API timing arithmetic can currently be verified with deterministic synthetic fixtures and without network access, Docker, or paid data. It is not a verified production data service and does not provide strategy-performance evidence.
+QData is an A-share research data-engineering prototype. Its Python SDK, `research_snapshot_v1` contract, and factor API adjusted reference arithmetic can currently be verified with deterministic synthetic fixtures and without network access, Docker, or paid data. It is not a verified production data service and does not provide strategy-performance evidence.
 
 ## Capability matrix
 
@@ -10,7 +10,7 @@ QData is an A-share research data-engineering prototype. Its Python SDK, `resear
 |---|---|---|
 | `research_snapshot_v1` | Implemented | Builds canonical CSV files plus a JSON manifest with SHA-256 digests, cutoff, timezone, source, data version, row counts, and quality status. Verification fails closed on an unknown schema, tampering, duplicate keys, missing fields, and late data. The public fixture is a synthetic contract sample, not market data. |
 | Local Python SDK | Implemented | The default mock backend queries securities, calendars, prices, trading constraints, PIT fundamentals, index/industry membership, universes, factors, and health data offline. |
-| Factor API timing arithmetic | Implemented | After-close signal → next-session-open fill → same-session-close mark. This verifies API/time alignment only; it is not a backtest, return claim, or trading recommendation. |
+| Factor API adjusted reference arithmetic | Implemented | After-close signal → next-session forward-adjusted open reference → same-session adjusted close mark. This checks API, ranking, and reference arithmetic only. Next-session tradability is not verified; this is not an execution or backtest, market evidence, or investment advice. |
 | Quality, version, and batch semantics | Unit-verified | Deterministic fake/unit tests cover strict completeness, explicit unsupported minute data, PIT/version filtering, immutable versions, and the batch lifecycle. |
 | ClickHouse vintage migration selector | Locally integration-tested | Local Docker with ClickHouse 24.8.14.39 covered fresh old-key full schemas and four source rows in one old-key part through create-copy-EXCHANGE, old-key backup, and post-migration OPTIMIZE FINAL checks. This evidence is limited to the migration selector, not production operation; CI does not run database integration. |
 | PostgreSQL query selectors | Partially integration-tested locally | A disposable Postgres 16 database was built from `0001`, `0006`, and the seed. Real psycopg calls exercised PostgreSQL array binding, `DISTINCT ON`, PIT fundamentals, and `asof`/`vintage` version plus adjustment-factor selection. The market-data boundary remained a deterministic fake; query plans, cross-store transactions, failure recovery, performance, and sustained operation remain unverified, and CI does not run database integration. |
@@ -18,7 +18,7 @@ QData is an A-share research data-engineering prototype. Its Python SDK, `resear
 
 ## The one offline green path from a fresh checkout
 
-Prerequisite: Python 3.9–3.12. Run from the repository root:
+Prerequisite: Python 3.10–3.12. Run from the repository root:
 
 ```bash
 snapshot_root="$(mktemp -d)"
@@ -30,7 +30,7 @@ python3 examples/factor_api_arithmetic_demo.py
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-This path imports repository code directly from the checkout, starts no databases, calls no external data sources, and needs no paid credentials. Snapshot build refuses to overwrite different content; verify rechecks the file set, content hashes, and contract semantics. The CI workflow is configured to pin its packaging toolchain and then perform the local editable install offline, followed by the full unittest suite, both public examples, and snapshot build/verify/repeatability checks on Python 3.9, 3.10, 3.11, and 3.12. This is a workflow description, not a claim that hosted GitHub CI has run.
+This path imports repository code directly from the checkout, starts no databases, calls no external data sources, and needs no paid credentials. Snapshot build refuses to overwrite different content; verify rechecks the file set, content hashes, and contract semantics. The CI workflow is configured to pin its packaging toolchain and then perform the local editable install offline, followed by the full unittest suite, both public examples, and snapshot build/verify/repeatability checks on Python 3.10, 3.11, and 3.12. This is a workflow description, not a claim that hosted GitHub CI has run.
 
 ## `research_snapshot_v1` first
 
@@ -56,7 +56,7 @@ python3 examples/quickstart.py
 
 This uses the default mock backend to demonstrate the SDK query shape and explicitly supports importing repository code directly from a fresh checkout.
 
-## After-close signal → next-open arithmetic
+## After-close signal → next-session adjusted reference arithmetic
 
 ```bash
 python3 examples/factor_api_arithmetic_demo.py
@@ -65,12 +65,12 @@ python3 examples/factor_api_arithmetic_demo.py
 The example timeline is:
 
 1. obtain the mock `momentum_20d` signal after the `2024-01-02` close;
-2. rank the synthetic universe by that factor;
-3. use the `2024-01-03` open as the fill price;
-4. use the `2024-01-03` close as the mark price;
-5. calculate `close / open - 1` per sample, then display bucket and benchmark arithmetic.
+2. rank the synthetic signal-date-screened universe by that factor; next-session tradability is not verified;
+3. read the `2024-01-03` `adjust="forward"` open as `adjusted_open_reference`;
+4. read that session's adjusted close as `adjusted_close_mark`;
+5. calculate `marked_change = adjusted_close_mark / adjusted_open_reference - 1` per sample, then display neutral highest/lowest-factor and universe-mean arithmetic.
 
-Output explicitly reports `after_close`, `next_session_open`, and `next_session_close`. The numbers come from a deterministic mock fixture and only check API, ranking, and time alignment. They are not strategy performance, real-market evidence, or investment advice. See the [signal timing ADR](docs/adr/0002-after-close-signal-timing.md).
+Output explicitly reports `signal_timing=after_close`, `reference_timing=next_session_forward_adjusted_open_to_close`, and `next_session_tradability_verified=false`. The numbers come from a deterministic mock fixture and check API, ranking, and adjusted reference arithmetic only. This is not an execution or backtest, an executable-price claim, real-market evidence, or investment advice. See the [signal timing ADR](docs/adr/0002-after-close-signal-timing.md).
 
 ## Tests
 

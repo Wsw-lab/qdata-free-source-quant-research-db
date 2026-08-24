@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="QData is a zero-cost A-share quant research database project built with free-source adapters, data quality checks, PIT research modeling and admin observability.">
+  <meta name="description" content="QData is an A-share research data-engineering prototype with synthetic fixtures, unit-verified contracts, bounded local selector evidence, and explicit integration gaps.">
   <title>QData Free Source Quant Research Database</title>
   <link rel="stylesheet" href="styles.css">
 </head>
@@ -24,10 +24,10 @@
   <main id="top">
     <section class="hero" aria-label="Project hero">
       <div class="hero-inner">
-        <p class="eyebrow">Zero-cost quant data engineering project</p>
+        <p class="eyebrow">A-share research data-engineering prototype</p>
         <h1>QData Free Source Quant Research Database</h1>
         <p class="hero-copy">
-          An A-share research data platform that turns open-source and public financial data into an auditable quant research stack: ingestion, PIT modeling, source reliability, recovery workflows, and an admin console.
+          A prototype for auditable research contracts, PIT modeling, source governance, and SDK/API shapes. Its public green path uses synthetic fixtures; database evidence is explicitly bounded.
         </p>
         <div class="hero-actions">
           <a class="button primary" href="#proof">View verification</a>
@@ -38,27 +38,27 @@
 
     <section id="proof" class="section band">
       <div class="section-head">
-        <h2 class="section-title">Verified Engineering Signals</h2>
+        <h2 class="section-title">Evidence Boundaries</h2>
         <p class="section-note">
-          The page is meant to be a concise technical project overview: fast to read, backed by command outputs, and honest about the free-source boundary.
+          Current evidence is divided into offline deterministic checks, bounded local selectors, and work that still needs real integration.
         </p>
       </div>
       <div class="metric-grid">
         <div class="metric">
-          <strong>Offline</strong>
-          <span>deterministic unittest command for SDK, fake-backend, worker, API and console behavior</span>
+          <strong>Synthetic fixtures</strong>
+          <span>offline SDK examples and research_snapshot_v1 contract samples</span>
         </div>
         <div class="metric">
-          <strong>Local-only</strong>
-          <span>console smoke requires an explicitly started local API service</span>
+          <strong>Unit-verified</strong>
+          <span>deterministic contracts and public arithmetic are covered by unittest</span>
         </div>
         <div class="metric">
-          <strong>Candidates</strong>
-          <span>free-source adapters require source-by-source legal, coverage and SLA review</span>
+          <strong>Bounded local selectors</strong>
+          <span>focused Postgres 16 and ClickHouse 24.8 selector evidence only</span>
         </div>
         <div class="metric">
-          <strong>0 RMB</strong>
-          <span>current research route uses free/open/public sources, not paid production feeds</span>
+          <strong>Real integration pending</strong>
+          <span>query plans, cross-store transactions, recovery, performance and sustained operation</span>
         </div>
       </div>
     </section>
@@ -67,7 +67,7 @@
       <div class="section-head">
         <h2 class="section-title">How It Works</h2>
         <p class="section-note">
-          QData is not just a scraper. It is a small research data platform with storage, quality gates, source governance, worker automation and REST/admin surfaces.
+          The repository contains a prototype architecture. Presence of a component does not imply end-to-end or production verification.
         </p>
       </div>
       <div class="system-grid">
@@ -76,7 +76,7 @@
           <div class="pipeline">
             <div class="pipe-step">
               <span class="number">1</span>
-              <div><b>Collect free-source data</b><span>AKShare, BaoStock, Tushare free tier, exchange pages, public announcements and local fixtures.</span></div>
+              <div><b>Evaluate source candidates</b><span>Adapters and public-source candidates remain subject to legal, coverage and SLA review.</span></div>
               <span class="status">ingest</span>
             </div>
             <div class="pipe-step">
@@ -91,13 +91,13 @@
             </div>
             <div class="pipe-step">
               <span class="number">4</span>
-              <div><b>Serve research workflows</b><span>Python SDK, PostgreSQL metadata, ClickHouse time series, REST API and Upsilon admin console.</span></div>
+              <div><b>Expose prototype surfaces</b><span>Python SDK, storage schemas, REST API and admin-console shapes with distinct evidence levels.</span></div>
               <span class="status">serve</span>
             </div>
           </div>
         </div>
         <div class="panel">
-          <h3>Local Verification</h3>
+          <h3>Reproducible Checks</h3>
           <div class="proof">
             <b>Unit test suite</b>
             <code>python3 -m unittest discover -s tests -p 'test_*.py'
@@ -123,9 +123,9 @@ Use the current command output as evidence</code>
 
     <section id="sources" class="section band">
       <div class="section-head">
-        <h2 class="section-title">Free Source Strategy</h2>
+        <h2 class="section-title">Free-source candidates</h2>
         <p class="section-note">
-          The project is deliberately framed as a research database. Free sources can be excellent for learning, validation and strategy research, while commercial production use needs separate authorization.
+          Adapters are research candidates, not an assurance of current availability, coverage, licensing, redistribution rights, or service levels.
         </p>
       </div>
       <div class="system-grid">
@@ -166,7 +166,7 @@ Use the current command output as evidence</code>
         <div class="panel">
           <h3>Why This Is a Strong Engineering Project</h3>
           <div class="skills">
-            <div class="skill"><b>Data engineering</b><span>Schema design, migrations, PIT modeling, time-series storage and reproducible local Docker smoke tests.</span></div>
+            <div class="skill"><b>Data engineering</b><span>Schema design, migrations, PIT modeling, time-series storage and bounded local selector checks.</span></div>
             <div class="skill"><b>Quant research awareness</b><span>Trading calendars, adjusted prices, universe queries, factor values and future-function prevention.</span></div>
             <div class="skill"><b>Reliability thinking</b><span>Multi-source comparison, coverage checks, conflict rates, automatic downgrade and recovery actions.</span></div>
             <div class="skill"><b>Product communication</b><span>Clear documentation, admin console, API contract and an honest free-vs-production boundary.</span></div>
@@ -185,10 +185,10 @@ Use the current command output as evidence</code>
             This project shows how I think about data as infrastructure: not simply downloading market prices, but building a controlled research environment where every dataset has lineage, quality checks and source-risk evidence.
           </p>
           <p>
-            The current version intentionally focuses on a zero-cost research route. It documents software engineering choices, quantitative finance assumptions and independent project execution in a reproducible repository.
+            The current version focuses on deterministic synthetic fixtures and explicit evidence boundaries. Free/public providers remain candidates until their legal, coverage and service constraints are reviewed.
           </p>
           <p>
-            The next technical milestone is to publish more example notebooks: factor construction, PIT financial screening, event-study samples and a small backtest powered by the QData SDK.
+            The next technical milestone is broader real-database integration plus additional reference-arithmetic, PIT-screening and event-study contract examples.
           </p>
           <div class="hero-actions">
             <a class="button primary" href="#system">Review architecture</a>

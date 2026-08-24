@@ -2,7 +2,7 @@
 
 [English](README_EN.md) · [不可变快照 ADR](docs/adr/0001-research-snapshot-and-time-contract.md) · [信号时序 ADR](docs/adr/0002-after-close-signal-timing.md)
 
-QData 是一个 A 股研究数据工程原型。当前可在无网络、无 Docker、无付费数据的环境中，用确定性合成 fixture 验证 Python SDK、`research_snapshot_v1` 合约和因子 API 的时序算术。它不是已验证的生产数据服务，也不提供策略收益证据。
+QData 是一个 A 股研究数据工程原型。当前可在无网络、无 Docker、无付费数据的环境中，用确定性合成 fixture 验证 Python SDK、`research_snapshot_v1` 合约和因子 API 的前复权参考算术。它不是已验证的生产数据服务，也不提供策略收益证据。
 
 ## 能力矩阵
 
@@ -10,7 +10,7 @@ QData 是一个 A 股研究数据工程原型。当前可在无网络、无 Dock
 |---|---|---|
 | `research_snapshot_v1` | 已实现 | 构建规范化 CSV/JSON manifest，记录 SHA-256、cutoff、timezone、source、data version、行数和质量状态；验证未知 schema、篡改、重复主键、缺失字段和晚到数据时 fail closed。公开 fixture 是合成合约样本，不是市场数据。 |
 | 本地 Python SDK | 已实现 | 默认 mock 后端可离线查询证券、日历、价格、交易约束、PIT 基本面、指数/行业、股票池、因子和健康信息。 |
-| 因子 API 时序算术 | 已实现 | 收盘后信号 → 下一交易日开盘成交 → 当日收盘计值；只验证 API/时序对齐，不代表回测、收益或交易建议。 |
+| 因子 API 前复权参考算术 | 已实现 | 收盘后信号 → 下一交易日前复权开盘参考值 → 同日前复权收盘标记；只验证 API、排序和参考值算术，未验证下一交易日可交易性，不是成交、执行或回测，也不是市场或投资证据。 |
 | 质量、版本与批次语义 | 单元验证 | 严格完整率门禁、显式分钟频率失败、PIT/版本过滤、不可变版本和批次生命周期由确定性 fake/unit test 覆盖。 |
 | ClickHouse vintage 迁移 selector | 本地集成验证 | 已在本地 Docker 的 ClickHouse 24.8.14.39 上，以 fresh old-key full schemas 和 four source rows in one old-key part（四行位于一个旧键 part）跑通 create-copy-EXCHANGE、old-key backup 及 OPTIMIZE FINAL 后验证。该证据只覆盖迁移 selector，不覆盖生产运行；CI does not run database integration。 |
 | PostgreSQL 查询选择器 | 本地部分集成验证 | 已在一次性 Postgres 16 数据库中从零应用 `0001`、`0006` 和 seed，并通过真实 psycopg 验证 PostgreSQL array binding、`DISTINCT ON`、PIT 基本面以及 `asof`/`vintage` 版本与复权因子选择。行情边界仍为确定性 fake；query plans、cross-store transactions、故障恢复、性能和长期运行仍未验证，且 CI does not run database integration。 |
@@ -18,7 +18,7 @@ QData 是一个 A 股研究数据工程原型。当前可在无网络、无 Dock
 
 ## 全新 checkout 的唯一离线绿色路径
 
-前置条件：Python 3.9–3.12。在仓库根目录执行：
+前置条件：Python 3.10–3.12。在仓库根目录执行：
 
 ```bash
 snapshot_root="$(mktemp -d)"
@@ -30,7 +30,7 @@ python3 examples/factor_api_arithmetic_demo.py
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-这条路径直接从 checkout 导入仓库代码，不启动数据库、不调用外部数据源，也不需要付费凭据。snapshot build 不会覆盖不同内容的既有目录；verify 会重新校验文件集合、内容哈希和合约语义。CI workflow 配置为在 Python 3.9、3.10、3.11 和 3.12 上先固定 packaging toolchain，再离线执行本地 editable install、全量 unittest、两个公开示例及 snapshot build/verify/repeatability 检查；这里不声称远端 GitHub CI 已实际运行。
+这条路径直接从 checkout 导入仓库代码，不启动数据库、不调用外部数据源，也不需要付费凭据。snapshot build 不会覆盖不同内容的既有目录；verify 会重新校验文件集合、内容哈希和合约语义。CI workflow 配置为在 Python 3.10、3.11 和 3.12 上先固定 packaging toolchain，再离线执行本地 editable install、全量 unittest、两个公开示例及 snapshot build/verify/repeatability 检查；这里不声称远端 GitHub CI 已实际运行。
 
 ## `research_snapshot_v1` 优先工作流
 
@@ -56,7 +56,7 @@ python3 examples/quickstart.py
 
 该示例使用默认 mock 后端展示 SDK 查询形态，并显式支持直接从 fresh checkout 导入本仓库代码。
 
-## 收盘后信号 → 下一开盘算术
+## 收盘后信号 → 下一日前复权参考算术
 
 ```bash
 python3 examples/factor_api_arithmetic_demo.py
@@ -65,12 +65,12 @@ python3 examples/factor_api_arithmetic_demo.py
 示例的时间轴是：
 
 1. `2024-01-02` 收盘后取得 mock `momentum_20d` 信号；
-2. 按因子值排序合成股票池；
-3. `2024-01-03` 开盘作为成交价；
-4. `2024-01-03` 收盘作为计值价；
-5. 对每个样本计算 `close / open - 1`，再展示桶和基准的纯算术。
+2. 对信号日筛选出的合成股票池按因子值排序；这个筛选未验证下一交易日可交易性；
+3. 读取 `adjust="forward"` 的 `2024-01-03` 开盘值作为 `adjusted_open_reference`；
+4. 读取同日的前复权收盘值作为 `adjusted_close_mark`；
+5. 对每个样本计算 `marked_change = adjusted_close_mark / adjusted_open_reference - 1`，再展示最高/最低因子样本及全体均值的纯算术。
 
-输出会明确显示 `after_close`、`next_session_open` 和 `next_session_close`。这些数字来自确定性 mock fixture，仅用于验证 API、排序和时间对齐，不是策略表现、真实市场证据或投资建议。完整决策见[信号时序 ADR](docs/adr/0002-after-close-signal-timing.md)。
+输出会明确显示 `signal_timing=after_close`、`reference_timing=next_session_forward_adjusted_open_to_close` 和 `next_session_tradability_verified=false`。这些数字来自确定性 mock fixture，仅用于验证 API、排序和前复权参考算术；它不是成交、执行或回测，不是可交易价格、真实市场证据或投资建议。完整决策见[信号时序 ADR](docs/adr/0002-after-close-signal-timing.md)。
 
 ## 测试
 
@@ -80,7 +80,7 @@ python3 examples/factor_api_arithmetic_demo.py
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-聚焦验证公开时序算术：
+聚焦验证公开前复权参考算术：
 
 ```bash
 python3 -m unittest -v tests.test_factor_api_arithmetic_demo
