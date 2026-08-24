@@ -1,8 +1,10 @@
 import os
+from datetime import date, datetime
 from pathlib import Path
 import re
 import unittest
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,14 +31,24 @@ def _order_key(sql_block: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in match.group(1).split(","))
 
 
-def _migration_order_key(sql: str, table: str) -> tuple[str, ...]:
+def _migration_block(sql: str, table: str) -> str:
+    rebuild = f"{table}__0056_rebuild"
     match = re.search(
-        rf"ALTER TABLE {re.escape(table)}\b.*?MODIFY ORDER BY\s*\(([^)]*)\)\s*;",
+        rf"CREATE TABLE {re.escape(rebuild)}\b.*?"
+        rf"EXCHANGE TABLES {re.escape(table)} AND {re.escape(rebuild)}\s*;.*?"
+        rf"SYSTEM START MERGES {re.escape(table)}\s*;",
         sql,
         flags=re.DOTALL,
     )
     if not match:
-        raise AssertionError(f"version-preserving ALTER not found: {table}")
+        raise AssertionError(f"create-copy-exchange migration not found: {table}")
+    return match.group(0)
+
+
+def _migration_order_key(sql: str, table: str) -> tuple[str, ...]:
+    match = re.search(r"ORDER BY\s*\(([^)]*)\)", _migration_block(sql, table))
+    if not match:
+        raise AssertionError(f"rebuilt ORDER BY tuple not found: {table}")
     return tuple(part.strip() for part in match.group(1).split(","))
 
 
@@ -112,6 +124,14 @@ class ClickHouseVintageSchemaContractTest(unittest.TestCase):
 
         for table, rows in fixtures.items():
             with self.subTest(table=table):
+                block = _migration_block(sql, table)
+                rebuild = f"{table}__0056_rebuild"
+                self.assertIn(f"INSERT INTO {rebuild}", block)
+                self.assertIn(f"FROM {table}", block)
+                self.assertIn(f"SYSTEM STOP MERGES {table}", block)
+                self.assertIn(f"EXCHANGE TABLES {table} AND {rebuild}", block)
+                self.assertIn(f"SYSTEM STOP MERGES {rebuild}", block)
+                self.assertIn(f"SYSTEM START MERGES {table}", block)
                 key = _migration_order_key(sql, table)
                 merged = sorted(_merged_rows(rows, key), key=lambda row: row["data_version"])
                 self.assertEqual(
@@ -125,7 +145,7 @@ class ClickHouseVintageSchemaContractTest(unittest.TestCase):
     "set QDATA_RUN_CLICKHOUSE_INTEGRATION=1 to run ClickHouse 24.8 migration test",
 )
 class ClickHouseVintageMigrationIntegrationTest(unittest.TestCase):
-    def test_optimize_final_retains_vintage_and_publication_gate(self) -> None:
+    def test_daily_and_minute_optimize_final_retain_vintages_and_retries(self) -> None:
         try:
             import clickhouse_connect
         except ImportError as exc:
@@ -136,69 +156,205 @@ class ClickHouseVintageMigrationIntegrationTest(unittest.TestCase):
             "http://qdata:qdata@127.0.0.1:18123/default",
         )
         client = clickhouse_connect.get_client(dsn=dsn)
-        table = f"qdata_vintage_migration_{uuid4().hex[:12]}"
-        qualified = f"default.{table}"
-        try:
-            client.command(
-                f"""
-                CREATE TABLE {qualified} (
-                    security_id UInt64,
-                    trade_date Date,
-                    close Nullable(Float64),
-                    data_version UInt64,
-                    ingest_time DateTime64(3, 'Asia/Shanghai')
-                )
-                ENGINE = ReplacingMergeTree(ingest_time)
-                PARTITION BY toYYYYMM(trade_date)
-                ORDER BY (security_id, trade_date)
-                """
-            )
-            client.insert(
-                qualified,
-                [
-                    [1, "2024-01-02", 10.0, 7001, "2024-01-02 17:00:00"],
-                    [1, "2024-01-02", 11.0, 7001, "2024-01-02 17:01:00"],
-                    [1, "2024-01-02", 20.0, 7002, "2024-01-02 18:00:00"],
-                ],
-                column_names=[
+        migration = VINTAGE_MIGRATION.read_text(encoding="utf-8")
+        shanghai = ZoneInfo("Asia/Shanghai")
+        trade_day = date(2024, 1, 2)
+        bar_at = datetime(2024, 1, 2, 9, 31, tzinfo=shanghai)
+        retry_rows = [
+            # Deliberately reverse/interleave versions so row order cannot make
+            # a broken sorting-key migration appear correct.
+            (20.0, 7002, datetime(2024, 1, 2, 18, 0, tzinfo=shanghai)),
+            (10.0, 7001, datetime(2024, 1, 2, 17, 0, tzinfo=shanghai)),
+            (19.0, 7002, datetime(2024, 1, 2, 17, 59, tzinfo=shanghai)),
+            (11.0, 7001, datetime(2024, 1, 2, 17, 1, tzinfo=shanghai)),
+        ]
+        specs = {
+            "qts.daily_bar": {
+                "old_sorting_key": "security_id, trade_date",
+                "column_names": [
                     "security_id", "trade_date", "close", "data_version", "ingest_time",
                 ],
-            )
-            migration = VINTAGE_MIGRATION.read_text(encoding="utf-8")
-            statement = re.search(
-                r"ALTER TABLE qts\.daily_bar\b.*?;",
-                migration,
-                flags=re.DOTALL,
-            )
-            self.assertIsNotNone(statement)
-            client.command(
-                statement.group(0).replace("qts.daily_bar", qualified).rstrip(";")
-            )
-            client.command(f"OPTIMIZE TABLE {qualified} FINAL")
+                "rows": [
+                    [1, trade_day, close, version, ingest_time]
+                    for close, version, ingest_time in retry_rows
+                ],
+                "sentinel": [
+                    2, trade_day, 99.0, 9999,
+                    datetime(2024, 1, 2, 19, 0, tzinfo=shanghai),
+                ],
+                "sorting_key": "security_id, trade_date, data_version",
+            },
+            "qts.minute_bar": {
+                "old_sorting_key": "security_id, trade_date, bar_time",
+                "column_names": [
+                    "security_id", "trade_date", "bar_time", "close", "data_version",
+                    "ingest_time",
+                ],
+                "rows": [
+                    [1, trade_day, bar_at, close, version, ingest_time]
+                    for close, version, ingest_time in retry_rows
+                ],
+                "sentinel": [
+                    2, trade_day, bar_at, 99.0, 9999,
+                    datetime(2024, 1, 2, 19, 0, tzinfo=shanghai),
+                ],
+                "sorting_key": "security_id, trade_date, bar_time, data_version",
+            },
+        }
+        qualified_tables = []
+        try:
+            for source_table, spec in specs.items():
+                with self.subTest(table=source_table):
+                    table = f"qdata_vintage_{source_table.rsplit('.', 1)[1]}_{uuid4().hex[:10]}"
+                    qualified = f"default.{table}"
+                    qualified_tables.append(qualified)
+                    source_ddl = _table_block(
+                        INIT_DDL.read_text(encoding="utf-8"), source_table
+                    )
+                    old_key_ddl = source_ddl.replace(
+                        f"CREATE TABLE IF NOT EXISTS {source_table}",
+                        f"CREATE TABLE {qualified}",
+                        1,
+                    )
+                    old_key_ddl = re.sub(
+                        r"ORDER BY\s*\([^)]*\)",
+                        f"ORDER BY ({spec['old_sorting_key']})",
+                        old_key_ddl,
+                        count=1,
+                    )
+                    client.command(old_key_ddl.rstrip(";"))
+                    client.command(f"SYSTEM STOP MERGES {qualified}")
+                    for row in spec["rows"]:
+                        client.insert(
+                            qualified,
+                            [row],
+                            column_names=spec["column_names"],
+                        )
+                    source_rows = client.query(
+                        f"""
+                        SELECT data_version, close, ingest_time
+                        FROM {qualified}
+                        WHERE security_id = 1
+                        ORDER BY ingest_time
+                        """
+                    ).result_rows
+                    self.assertEqual(
+                        [(row[0], row[1]) for row in source_rows],
+                        [(7001, 10.0), (7001, 11.0), (7002, 19.0), (7002, 20.0)],
+                    )
+                    source_engine = client.query(
+                        f"""
+                        SELECT engine
+                        FROM system.tables
+                        WHERE database = 'default' AND name = '{table}'
+                        """
+                    ).result_rows
+                    self.assertEqual(source_engine, [("ReplacingMergeTree",)])
+                    active_parts = client.query(
+                        f"""
+                        SELECT count()
+                        FROM system.parts
+                        WHERE database = 'default' AND table = '{table}' AND active
+                        """
+                    ).result_rows
+                    self.assertEqual(active_parts, [(4,)])
 
-            retained = client.query(
-                f"SELECT data_version, close FROM {qualified} FINAL ORDER BY data_version"
-            ).result_rows
-            latest_visible = client.query(
-                f"""
-                SELECT close FROM {qualified} FINAL
-                WHERE security_id = 1 AND trade_date = '2024-01-02'
-                  AND data_version IN (7001)
-                """
-            ).result_rows
-            vintage_v1 = client.query(
-                f"""
-                SELECT close FROM {qualified} FINAL
-                WHERE security_id = 1 AND trade_date = '2024-01-02'
-                  AND data_version = 7001
-                """
-            ).result_rows
+                    migration_block = _migration_block(migration, source_table)
+                    rendered_block = migration_block.replace(source_table, qualified)
+                    rebuild_qualified = f"{qualified}__0056_rebuild"
+                    qualified_tables.append(rebuild_qualified)
+                    for statement in rendered_block.split(";"):
+                        if statement.strip():
+                            client.command(statement)
 
-            self.assertEqual(retained, [(7001, 11.0), (7002, 20.0)])
-            self.assertEqual(latest_visible, [(11.0,)])
-            self.assertEqual(vintage_v1, [(11.0,)])
+                    sorting_key_rows = client.query(
+                        f"""
+                        SELECT sorting_key
+                        FROM system.tables
+                        WHERE database = 'default' AND name = '{table}'
+                        """
+                    ).result_rows
+                    self.assertEqual(sorting_key_rows, [(spec["sorting_key"],)])
+                    show_create = client.query(
+                        f"SHOW CREATE TABLE {qualified}"
+                    ).result_rows[0][0]
+                    self.assertIn(
+                        f"ORDER BY ({spec['sorting_key']})",
+                        " ".join(show_create.split()),
+                    )
+                    backup_rows = client.query(
+                        f"""
+                        SELECT data_version, close, ingest_time
+                        FROM {rebuild_qualified}
+                        WHERE security_id = 1
+                        ORDER BY ingest_time
+                        """
+                    ).result_rows
+                    self.assertEqual(
+                        [(row[0], row[1]) for row in backup_rows],
+                        [(7001, 10.0), (7001, 11.0), (7002, 19.0), (7002, 20.0)],
+                    )
+                    backup_sorting_key = client.query(
+                        f"""
+                        SELECT sorting_key
+                        FROM system.tables
+                        WHERE database = 'default'
+                          AND name = '{table}__0056_rebuild'
+                        """
+                    ).result_rows
+                    self.assertEqual(backup_sorting_key, [(spec["old_sorting_key"],)])
+                    copied_rows = client.query(
+                        f"""
+                        SELECT data_version, close, ingest_time
+                        FROM {qualified}
+                        WHERE security_id = 1
+                        ORDER BY ingest_time
+                        """
+                    ).result_rows
+                    self.assertEqual(
+                        sorted({row[0] for row in copied_rows}),
+                        [7001, 7002],
+                    )
+
+                    # A second part forces OPTIMIZE FINAL to rewrite the old
+                    # part under the new sorting key rather than passing due to
+                    # a single already-merged part.
+                    client.insert(
+                        qualified,
+                        [spec["sentinel"]],
+                        column_names=spec["column_names"],
+                    )
+                    client.command(f"OPTIMIZE TABLE {qualified} FINAL")
+
+                    retained = client.query(
+                        f"""
+                        SELECT data_version, close
+                        FROM {qualified}
+                        WHERE security_id = 1
+                        ORDER BY data_version
+                        """
+                    ).result_rows
+                    published_visible = client.query(
+                        f"""
+                        SELECT close FROM {qualified}
+                        WHERE security_id = 1 AND trade_date = '2024-01-02'
+                          AND data_version IN (7001)
+                        """
+                    ).result_rows
+                    vintage_v1 = client.query(
+                        f"""
+                        SELECT close FROM {qualified}
+                        WHERE security_id = 1 AND trade_date = '2024-01-02'
+                          AND data_version = 7001
+                        """
+                    ).result_rows
+
+                    self.assertEqual(retained, [(7001, 11.0), (7002, 20.0)])
+                    self.assertEqual(published_visible, [(11.0,)])
+                    self.assertEqual(vintage_v1, [(11.0,)])
         finally:
-            client.command(f"DROP TABLE IF EXISTS {qualified} SYNC")
+            for qualified in qualified_tables:
+                client.command(f"DROP TABLE IF EXISTS {qualified} SYNC")
             client.close()
 
 
