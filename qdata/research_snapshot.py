@@ -10,6 +10,8 @@ This module is intentionally narrow: it defines the interchange contract
 between QData and a research consumer.  It does not claim that an upstream
 provider is point-in-time correct; it makes the provider's cutoff and
 ``available_at`` assertions explicit and independently verifiable.
+Snapshot artifacts are data-contract evidence, not strategy or performance
+evidence.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -31,6 +34,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 SCHEMA_VERSION = "research_snapshot_v1"
 MANIFEST_FILENAME = "manifest.json"
+ARTIFACT_NOTICE = (
+    "Research data contract artifact; not strategy or performance evidence."
+)
 
 
 class ResearchSnapshotError(Exception):
@@ -71,6 +77,7 @@ DATASET_CONTRACTS: Mapping[str, DatasetContract] = {
             "adjustment_factor",
             "volume",
             "amount",
+            "bar_end_at",
             "available_at",
             "source_id",
             "batch_id",
@@ -89,6 +96,7 @@ DATASET_CONTRACTS: Mapping[str, DatasetContract] = {
             "adjustment_factor": "number",
             "volume": "number",
             "amount": "number",
+            "bar_end_at": "timestamp",
             "available_at": "timestamp",
             "source_id": "string",
             "batch_id": "string",
@@ -197,6 +205,7 @@ _MANIFEST_KEYS = {
     "source",
     "data_version",
     "quality_status",
+    "artifact_notice",
     "datasets",
 }
 
@@ -210,10 +219,11 @@ def build_research_snapshot(
     source: str,
     data_version: str,
     quality_status: Mapping[str, Any],
+    artifact_notice: str = ARTIFACT_NOTICE,
 ) -> dict[str, Any]:
     """Build an immutable deterministic snapshot and return its manifest.
 
-    A staged snapshot is verified before publication and its manifest is moved
+    A staged snapshot is verified before publication and its manifest is created
     last. Existing content is never replaced. If the exact same snapshot
     already exists, it is verified and returned unchanged.
     """
@@ -225,11 +235,13 @@ def build_research_snapshot(
     canonical_source = _required_string(source, "source")
     canonical_version = _required_string(data_version, "data_version")
     canonical_quality = _normalize_quality_status(quality_status)
+    canonical_notice = _required_string(artifact_notice, "artifact_notice")
 
     rows_by_dataset = _canonicalize_datasets(
         datasets,
         cutoff=cutoff,
         data_version=canonical_version,
+        snapshot_timezone=ZoneInfo(canonical_timezone),
     )
     _validate_cross_dataset_contract(rows_by_dataset)
 
@@ -249,6 +261,7 @@ def build_research_snapshot(
         "source": canonical_source,
         "data_version": canonical_version,
         "quality_status": canonical_quality,
+        "artifact_notice": canonical_notice,
         "datasets": dataset_metadata,
     }
     snapshot_id = "sha256:" + _sha256(_canonical_json_bytes(manifest_without_id))
@@ -276,7 +289,7 @@ def build_research_snapshot(
         for name, payload in file_payloads.items():
             (staging / f"{name}.csv").write_bytes(payload)
         (staging / MANIFEST_FILENAME).write_bytes(manifest_payload)
-        verified = verify_research_snapshot(staging)
+        verify_research_snapshot(staging)
         try:
             # Reserving the final name with mkdir is deliberately used instead
             # of os.rename: POSIX rename may replace an existing empty
@@ -296,33 +309,27 @@ def build_research_snapshot(
                     f"{destination}"
                 ) from exc
             return existing
-        published_names: list[str] = []
+        publication_payloads = {
+            f"{name}.csv": payload for name, payload in file_payloads.items()
+        }
+        publication_payloads[MANIFEST_FILENAME] = manifest_payload
         try:
-            # Publish the manifest last. A concurrent verifier either observes
-            # an incomplete bundle and fails closed, or the complete bundle.
-            for filename in sorted(
-                expected
-                for expected in _expected_snapshot_filenames()
-                if expected != MANIFEST_FILENAME
-            ):
-                (staging / filename).replace(destination / filename)
-                published_names.append(filename)
-            (staging / MANIFEST_FILENAME).replace(destination / MANIFEST_FILENAME)
-            published_names.append(MANIFEST_FILENAME)
-        except Exception:
-            # Remove only files created by this builder. Never recursively
-            # delete content another process may have added.
-            for filename in reversed(published_names):
-                try:
-                    (destination / filename).unlink()
-                except FileNotFoundError:
-                    pass
-            try:
-                destination.rmdir()
-            except OSError:
-                pass
+            directory_identity, published_files = _publish_exclusive_files(
+                destination, publication_payloads
+            )
+        except SnapshotImmutableError:
             raise
-        return verified
+        try:
+            # Verify the final directory independently. Staging verification
+            # cannot prove that publication preserved file identities.
+            return verify_research_snapshot(destination)
+        except Exception:
+            _cleanup_owned_files(
+                destination,
+                directory_identity=directory_identity,
+                owned_files=published_files,
+            )
+            raise
     finally:
         if staging.exists():
             shutil.rmtree(staging)
@@ -334,11 +341,163 @@ def verify_research_snapshot(
     """Verify hashes, manifest, schemas, canonical bytes, and PIT cutoff."""
 
     root = Path(snapshot_dir)
-    if root.is_symlink() or not root.is_dir():
-        raise SnapshotVerificationError(f"snapshot path is not a regular directory: {root}")
+    directory_fd, directory_identity = _open_regular_directory(root)
+    try:
+        payloads, file_identities = _read_snapshot_payloads(directory_fd)
+        manifest_payload = payloads[MANIFEST_FILENAME]
+        try:
+            manifest = json.loads(manifest_payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SnapshotVerificationError(
+                "manifest is not valid UTF-8 JSON"
+            ) from exc
+        if not isinstance(manifest, dict):
+            raise SnapshotVerificationError("manifest root must be an object")
+        if manifest_payload != _canonical_json_bytes(manifest):
+            raise SnapshotVerificationError("manifest is not canonical JSON")
+        if set(manifest) != _MANIFEST_KEYS:
+            raise SnapshotVerificationError(
+                "manifest fields do not match the v1 contract"
+            )
+        if manifest.get("schema_version") != SCHEMA_VERSION:
+            raise SnapshotVerificationError(
+                f"unsupported schema_version: {manifest.get('schema_version')!r}"
+            )
+        if manifest.get("format") != "csv+canonical-json":
+            raise SnapshotVerificationError("unsupported snapshot format")
 
+        try:
+            cutoff = _parse_timestamp(manifest.get("cutoff_ts"), "cutoff_ts")
+            canonical_cutoff = _format_timestamp(cutoff)
+            timezone_name = _validate_timezone(manifest.get("timezone"))
+            source = _required_string(manifest.get("source"), "source")
+            data_version = _required_string(
+                manifest.get("data_version"), "data_version"
+            )
+            quality_status = _normalize_quality_status(
+                manifest.get("quality_status")
+            )
+            artifact_notice = _required_string(
+                manifest.get("artifact_notice"), "artifact_notice"
+            )
+        except SnapshotValidationError as exc:
+            raise SnapshotVerificationError(str(exc)) from exc
+        if manifest["cutoff_ts"] != canonical_cutoff:
+            raise SnapshotVerificationError("cutoff_ts is not in canonical UTC form")
+        if (
+            manifest["timezone"] != timezone_name
+            or manifest["source"] != source
+            or manifest["data_version"] != data_version
+            or manifest["artifact_notice"] != artifact_notice
+        ):
+            raise SnapshotVerificationError(
+                "timezone, source, data_version, or artifact_notice is not canonical"
+            )
+        if manifest["quality_status"] != quality_status:
+            raise SnapshotVerificationError("quality_status is not canonical")
+
+        manifest_datasets = manifest.get("datasets")
+        if not isinstance(manifest_datasets, dict) or set(manifest_datasets) != set(
+            DATASET_CONTRACTS
+        ):
+            raise SnapshotVerificationError(
+                "manifest datasets do not match the v1 contract"
+            )
+
+        rows_by_dataset: dict[str, list[dict[str, str]]] = {}
+        for name, contract in DATASET_CONTRACTS.items():
+            payload = payloads[f"{name}.csv"]
+            metadata = manifest_datasets[name]
+            if not isinstance(metadata, dict):
+                raise SnapshotVerificationError(
+                    f"manifest metadata for {name} must be an object"
+                )
+            if metadata.get("sha256") != _sha256(payload):
+                raise SnapshotVerificationError(f"SHA256 mismatch for {name}.csv")
+            try:
+                rows = _read_canonical_csv(name, contract, payload)
+                canonical_rows = _canonicalize_rows(
+                    name,
+                    contract,
+                    rows,
+                    cutoff=cutoff,
+                    data_version=data_version,
+                    snapshot_timezone=ZoneInfo(timezone_name),
+                )
+            except SnapshotValidationError as exc:
+                raise SnapshotVerificationError(str(exc)) from exc
+            canonical_payload = _csv_bytes(contract, canonical_rows)
+            if payload != canonical_payload:
+                raise SnapshotVerificationError(f"{name}.csv is not canonical")
+            expected_metadata = _dataset_metadata(
+                name, contract, canonical_rows, canonical_payload
+            )
+            if metadata != expected_metadata:
+                raise SnapshotVerificationError(
+                    f"manifest metadata mismatch for {name}"
+                )
+            rows_by_dataset[name] = canonical_rows
+
+        try:
+            _validate_cross_dataset_contract(rows_by_dataset)
+        except SnapshotValidationError as exc:
+            raise SnapshotVerificationError(str(exc)) from exc
+
+        manifest_without_id = dict(manifest)
+        claimed_snapshot_id = manifest_without_id.pop("snapshot_id")
+        expected_snapshot_id = "sha256:" + _sha256(
+            _canonical_json_bytes(manifest_without_id)
+        )
+        if claimed_snapshot_id != expected_snapshot_id:
+            raise SnapshotVerificationError(
+                "snapshot_id does not match manifest content"
+            )
+
+        _recheck_snapshot_identities(
+            root,
+            directory_fd,
+            directory_identity=directory_identity,
+            file_identities=file_identities,
+        )
+        return manifest
+    finally:
+        os.close(directory_fd)
+
+
+_DirectoryIdentity = tuple[int, int]
+_FileIdentity = tuple[int, int, int, int]
+
+
+def _open_regular_directory(path: Path) -> tuple[int, _DirectoryIdentity]:
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise SnapshotVerificationError(
+            "platform lacks O_NOFOLLOW/O_DIRECTORY; secure verification is unavailable"
+        )
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        directory_fd = os.open(os.fspath(path), flags)
+    except OSError as exc:
+        raise SnapshotVerificationError(
+            f"snapshot path is not a regular directory without symlinks: {path}"
+        ) from exc
+    metadata = os.fstat(directory_fd)
+    if not stat.S_ISDIR(metadata.st_mode):
+        os.close(directory_fd)
+        raise SnapshotVerificationError(
+            f"snapshot path is not a regular directory: {path}"
+        )
+    return directory_fd, (metadata.st_dev, metadata.st_ino)
+
+
+def _read_snapshot_payloads(
+    directory_fd: int,
+) -> tuple[dict[str, bytes], dict[str, _FileIdentity]]:
     expected_names = _expected_snapshot_filenames()
-    actual_names = {entry.name for entry in root.iterdir()}
+    try:
+        actual_names = set(os.listdir(directory_fd))
+    except OSError as exc:
+        raise SnapshotVerificationError("cannot enumerate snapshot directory") from exc
     if actual_names != expected_names:
         missing = sorted(expected_names - actual_names)
         extra = sorted(actual_names - expected_names)
@@ -346,101 +505,234 @@ def verify_research_snapshot(
             f"snapshot file set mismatch; missing={missing}, extra={extra}"
         )
 
-    manifest_path = root / MANIFEST_FILENAME
-    if manifest_path.is_symlink() or not manifest_path.is_file():
-        raise SnapshotVerificationError("manifest must be a regular file")
-    manifest_payload = manifest_path.read_bytes()
+    payloads: dict[str, bytes] = {}
+    identities: dict[str, _FileIdentity] = {}
+    for filename in sorted(expected_names):
+        payload, identity = _read_regular_file_at(directory_fd, filename)
+        payloads[filename] = payload
+        identities[filename] = identity
+    return payloads, identities
+
+
+def _read_regular_file_at(
+    directory_fd: int,
+    filename: str,
+) -> tuple[bytes, _FileIdentity]:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     try:
-        manifest = json.loads(manifest_payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise SnapshotVerificationError("manifest is not valid UTF-8 JSON") from exc
-    if not isinstance(manifest, dict):
-        raise SnapshotVerificationError("manifest root must be an object")
-    if manifest_payload != _canonical_json_bytes(manifest):
-        raise SnapshotVerificationError("manifest is not canonical JSON")
-    if set(manifest) != _MANIFEST_KEYS:
-        raise SnapshotVerificationError("manifest fields do not match the v1 contract")
-    if manifest.get("schema_version") != SCHEMA_VERSION:
+        file_fd = os.open(filename, flags, dir_fd=directory_fd)
+    except OSError as exc:
         raise SnapshotVerificationError(
-            f"unsupported schema_version: {manifest.get('schema_version')!r}"
-        )
-    if manifest.get("format") != "csv+canonical-json":
-        raise SnapshotVerificationError("unsupported snapshot format")
-
+            f"{filename} must be a regular file without symlinks"
+        ) from exc
     try:
-        cutoff = _parse_timestamp(manifest.get("cutoff_ts"), "cutoff_ts")
-        canonical_cutoff = _format_timestamp(cutoff)
-        timezone_name = _validate_timezone(manifest.get("timezone"))
-        source = _required_string(manifest.get("source"), "source")
-        data_version = _required_string(manifest.get("data_version"), "data_version")
-        quality_status = _normalize_quality_status(manifest.get("quality_status"))
-    except SnapshotValidationError as exc:
-        raise SnapshotVerificationError(str(exc)) from exc
-    if manifest["cutoff_ts"] != canonical_cutoff:
-        raise SnapshotVerificationError("cutoff_ts is not in canonical UTC form")
-    if (
-        manifest["timezone"] != timezone_name
-        or manifest["source"] != source
-        or manifest["data_version"] != data_version
-    ):
-        raise SnapshotVerificationError(
-            "timezone, source, or data_version is not canonical"
-        )
-    if manifest["quality_status"] != quality_status:
-        raise SnapshotVerificationError("quality_status is not canonical")
-
-    manifest_datasets = manifest.get("datasets")
-    if not isinstance(manifest_datasets, dict) or set(manifest_datasets) != set(
-        DATASET_CONTRACTS
-    ):
-        raise SnapshotVerificationError("manifest datasets do not match the v1 contract")
-
-    rows_by_dataset: dict[str, list[dict[str, str]]] = {}
-    for name, contract in DATASET_CONTRACTS.items():
-        file_path = root / f"{name}.csv"
-        if file_path.is_symlink() or not file_path.is_file():
-            raise SnapshotVerificationError(f"{name} must be a regular file")
-        payload = file_path.read_bytes()
-        metadata = manifest_datasets[name]
-        if not isinstance(metadata, dict):
-            raise SnapshotVerificationError(f"manifest metadata for {name} must be an object")
-        if metadata.get("sha256") != _sha256(payload):
-            raise SnapshotVerificationError(f"SHA256 mismatch for {name}.csv")
-        try:
-            rows = _read_canonical_csv(name, contract, payload)
-            canonical_rows = _canonicalize_rows(
-                name,
-                contract,
-                rows,
-                cutoff=cutoff,
-                data_version=data_version,
+        before = os.fstat(file_fd)
+        _validate_open_file_metadata(filename, before)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(file_fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(file_fd)
+        _validate_open_file_metadata(filename, after)
+        before_identity = _file_identity(before)
+        after_identity = _file_identity(after)
+        if before_identity != after_identity or after.st_size != len(payload):
+            raise SnapshotVerificationError(
+                f"{filename} changed while it was being read"
             )
-        except SnapshotValidationError as exc:
-            raise SnapshotVerificationError(str(exc)) from exc
-        canonical_payload = _csv_bytes(contract, canonical_rows)
-        if payload != canonical_payload:
-            raise SnapshotVerificationError(f"{name}.csv is not canonical")
-        expected_metadata = _dataset_metadata(
-            name, contract, canonical_rows, canonical_payload
-        )
-        if metadata != expected_metadata:
-            raise SnapshotVerificationError(f"manifest metadata mismatch for {name}")
-        rows_by_dataset[name] = canonical_rows
+        return payload, after_identity
+    finally:
+        os.close(file_fd)
 
-    try:
-        _validate_cross_dataset_contract(rows_by_dataset)
-    except SnapshotValidationError as exc:
-        raise SnapshotVerificationError(str(exc)) from exc
 
-    manifest_without_id = dict(manifest)
-    claimed_snapshot_id = manifest_without_id.pop("snapshot_id")
-    expected_snapshot_id = "sha256:" + _sha256(
-        _canonical_json_bytes(manifest_without_id)
+def _validate_open_file_metadata(filename: str, metadata: os.stat_result) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SnapshotVerificationError(f"{filename} must be a regular file")
+    if metadata.st_nlink != 1:
+        raise SnapshotVerificationError(f"{filename} is exposed through a hard link")
+
+
+def _file_identity(metadata: os.stat_result) -> _FileIdentity:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
     )
-    if claimed_snapshot_id != expected_snapshot_id:
-        raise SnapshotVerificationError("snapshot_id does not match manifest content")
 
-    return manifest
+
+def _recheck_snapshot_identities(
+    root: Path,
+    directory_fd: int,
+    *,
+    directory_identity: _DirectoryIdentity,
+    file_identities: Mapping[str, _FileIdentity],
+) -> None:
+    try:
+        root_metadata = os.stat(root, follow_symlinks=False)
+    except OSError as exc:
+        raise SnapshotVerificationError(
+            "snapshot directory changed during verification"
+        ) from exc
+    if (
+        not stat.S_ISDIR(root_metadata.st_mode)
+        or (root_metadata.st_dev, root_metadata.st_ino) != directory_identity
+    ):
+        raise SnapshotVerificationError(
+            "snapshot directory changed during verification"
+        )
+    try:
+        current_names = set(os.listdir(directory_fd))
+    except OSError as exc:
+        raise SnapshotVerificationError(
+            "snapshot directory changed during verification"
+        ) from exc
+    if current_names != set(file_identities):
+        raise SnapshotVerificationError(
+            "snapshot file set changed during verification"
+        )
+    for filename, expected_identity in file_identities.items():
+        try:
+            metadata = os.stat(
+                filename,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise SnapshotVerificationError(
+                f"{filename} changed during verification"
+            ) from exc
+        _validate_open_file_metadata(filename, metadata)
+        if _file_identity(metadata) != expected_identity:
+            raise SnapshotVerificationError(
+                f"{filename} changed during verification"
+            )
+
+
+def _publish_exclusive_files(
+    destination: Path,
+    payloads: Mapping[str, bytes],
+) -> tuple[_DirectoryIdentity, dict[str, _FileIdentity]]:
+    try:
+        directory_fd, directory_identity = _open_regular_directory(destination)
+    except SnapshotVerificationError as exc:
+        raise SnapshotImmutableError(
+            f"cannot securely publish snapshot at {destination}"
+        ) from exc
+    owned_files: dict[str, _FileIdentity] = {}
+    ordered_names = sorted(name for name in payloads if name != MANIFEST_FILENAME)
+    ordered_names.append(MANIFEST_FILENAME)
+    try:
+        for filename in ordered_names:
+            try:
+                owned_files[filename] = _create_exclusive_file_at(
+                    directory_fd,
+                    filename,
+                    payloads[filename],
+                )
+            except FileExistsError as exc:
+                raise SnapshotImmutableError(
+                    f"concurrent entry already exists: {filename}"
+                ) from exc
+        os.fsync(directory_fd)
+        return directory_identity, owned_files
+    except Exception:
+        _cleanup_owned_entries_at(directory_fd, owned_files)
+        raise
+    finally:
+        os.close(directory_fd)
+
+
+def _create_exclusive_file_at(
+    directory_fd: int,
+    filename: str,
+    payload: bytes,
+) -> _FileIdentity:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    file_fd = os.open(filename, flags, 0o644, dir_fd=directory_fd)
+    created_inode: tuple[int, int] | None = None
+    try:
+        created = os.fstat(file_fd)
+        created_inode = (created.st_dev, created.st_ino)
+        if not stat.S_ISREG(created.st_mode) or created.st_nlink != 1:
+            raise SnapshotImmutableError(
+                f"exclusive publication did not create a private regular file: {filename}"
+            )
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(file_fd, payload[offset:])
+        os.fsync(file_fd)
+        metadata = os.fstat(file_fd)
+        _validate_open_file_metadata(filename, metadata)
+        if metadata.st_size != len(payload):
+            raise SnapshotImmutableError(
+                f"published byte count mismatch for {filename}"
+            )
+        return _file_identity(metadata)
+    except Exception:
+        if created_inode is not None:
+            _unlink_if_inode_matches(
+                directory_fd,
+                filename,
+                created_inode,
+            )
+        raise
+    finally:
+        os.close(file_fd)
+
+
+def _cleanup_owned_entries_at(
+    directory_fd: int,
+    owned_files: Mapping[str, _FileIdentity],
+) -> None:
+    for filename, identity in reversed(tuple(owned_files.items())):
+        _unlink_if_inode_matches(
+            directory_fd,
+            filename,
+            (identity[0], identity[1]),
+        )
+
+
+def _unlink_if_inode_matches(
+    directory_fd: int,
+    filename: str,
+    expected_inode: tuple[int, int],
+) -> None:
+    try:
+        metadata = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        return
+    if (metadata.st_dev, metadata.st_ino) != expected_inode:
+        return
+    try:
+        os.unlink(filename, dir_fd=directory_fd)
+    except OSError:
+        return
+
+
+def _cleanup_owned_files(
+    destination: Path,
+    *,
+    directory_identity: _DirectoryIdentity,
+    owned_files: Mapping[str, _FileIdentity],
+) -> None:
+    try:
+        directory_fd, current_identity = _open_regular_directory(destination)
+    except SnapshotVerificationError:
+        return
+    try:
+        if current_identity == directory_identity:
+            _cleanup_owned_entries_at(directory_fd, owned_files)
+            try:
+                os.fsync(directory_fd)
+            except OSError:
+                pass
+    finally:
+        os.close(directory_fd)
 
 
 def _canonicalize_datasets(
@@ -448,6 +740,7 @@ def _canonicalize_datasets(
     *,
     cutoff: datetime,
     data_version: str,
+    snapshot_timezone: ZoneInfo,
 ) -> dict[str, list[dict[str, str]]]:
     if not isinstance(datasets, Mapping):
         raise SnapshotValidationError("datasets must be a mapping")
@@ -465,6 +758,7 @@ def _canonicalize_datasets(
             list(datasets[name]),
             cutoff=cutoff,
             data_version=data_version,
+            snapshot_timezone=snapshot_timezone,
         )
         for name, contract in DATASET_CONTRACTS.items()
     }
@@ -477,6 +771,7 @@ def _canonicalize_rows(
     *,
     cutoff: datetime,
     data_version: str,
+    snapshot_timezone: ZoneInfo,
 ) -> list[dict[str, str]]:
     if not rows:
         raise SnapshotValidationError(f"{name} must contain at least one row")
@@ -520,14 +815,19 @@ def _canonicalize_rows(
             raise SnapshotValidationError(
                 f"daily_bar row {index} data_version does not match manifest"
             )
-        _validate_row_semantics(name, row, index)
+        _validate_row_semantics(name, row, index, snapshot_timezone)
         canonical.append(row)
 
     canonical.sort(key=lambda row: tuple(row[field] for field in contract.primary_key))
     return canonical
 
 
-def _validate_row_semantics(name: str, row: Mapping[str, str], index: int) -> None:
+def _validate_row_semantics(
+    name: str,
+    row: Mapping[str, str],
+    index: int,
+    snapshot_timezone: ZoneInfo,
+) -> None:
     if name == "daily_bar":
         open_price = Decimal(row["open_raw"])
         high = Decimal(row["high_raw"])
@@ -545,6 +845,20 @@ def _validate_row_semantics(name: str, row: Mapping[str, str], index: int) -> No
             raise SnapshotValidationError(
                 f"daily_bar row {index} volume and amount must be non-negative"
             )
+        bar_end_at = _parse_timestamp(row["bar_end_at"], "daily_bar.bar_end_at")
+        available_at = _parse_timestamp(
+            row["available_at"], "daily_bar.available_at"
+        )
+        if bar_end_at.astimezone(snapshot_timezone).date() != date.fromisoformat(
+            row["trade_date"]
+        ):
+            raise SnapshotValidationError(
+                f"daily_bar row {index} bar_end_at date differs from trade_date"
+            )
+        if available_at < bar_end_at:
+            raise SnapshotValidationError(
+                f"daily_bar row {index} available_at precedes bar_end_at"
+            )
     elif name == "tradability":
         if int(row["lot_size"]) <= 0:
             raise SnapshotValidationError(
@@ -555,6 +869,16 @@ def _validate_row_semantics(name: str, row: Mapping[str, str], index: int) -> No
                 raise SnapshotValidationError(
                     f"tradability row {index} {field} must be positive when present"
                 )
+        limit_up = Decimal(row["limit_up"]) if row["limit_up"] else None
+        limit_down = Decimal(row["limit_down"]) if row["limit_down"] else None
+        if limit_up is not None and limit_down is not None and limit_up <= limit_down:
+            raise SnapshotValidationError(
+                f"tradability row {index} limit_up must exceed limit_down"
+            )
+        if row["is_limit_up"] == "true" and row["is_limit_down"] == "true":
+            raise SnapshotValidationError(
+                f"tradability row {index} limit flags are mutually exclusive"
+            )
         if row["is_suspended"] == "true" and (
             row["can_buy"] != "false" or row["can_sell"] != "false"
         ):
@@ -572,17 +896,33 @@ def _validate_row_semantics(name: str, row: Mapping[str, str], index: int) -> No
     elif name == "security_membership":
         list_date = date.fromisoformat(row["list_date"])
         valid_from = date.fromisoformat(row["valid_from"])
+        delist_date = (
+            date.fromisoformat(row["delist_date"]) if row["delist_date"] else None
+        )
+        valid_to = date.fromisoformat(row["valid_to"]) if row["valid_to"] else None
         if valid_from < list_date:
             raise SnapshotValidationError(
                 f"security_membership row {index} valid_from precedes list_date"
             )
-        if row["delist_date"] and date.fromisoformat(row["delist_date"]) < list_date:
+        if delist_date is not None and delist_date < list_date:
             raise SnapshotValidationError(
                 f"security_membership row {index} delist_date precedes list_date"
             )
-        if row["valid_to"] and date.fromisoformat(row["valid_to"]) < valid_from:
+        if valid_to is not None and valid_to <= valid_from:
             raise SnapshotValidationError(
-                f"security_membership row {index} valid_to precedes valid_from"
+                f"security_membership row {index} valid_to must be after valid_from"
+            )
+        if delist_date is not None and valid_to is None:
+            raise SnapshotValidationError(
+                f"security_membership row {index} delist_date requires exclusive valid_to"
+            )
+        if (
+            delist_date is not None
+            and valid_to is not None
+            and valid_to > delist_date
+        ):
+            raise SnapshotValidationError(
+                f"security_membership row {index} valid_to cannot exceed delist_date"
             )
     elif name == "fundamental_pit":
         published_at = _parse_timestamp(row["published_at"], "published_at")
@@ -612,6 +952,49 @@ def _validate_cross_dataset_contract(
             f"missing_tradability={missing}, extra_tradability={extra}"
         )
 
+    daily_by_key = {
+        (row["symbol"], row["trade_date"]): row
+        for row in rows_by_dataset["daily_bar"]
+    }
+    tradability_by_key = {
+        (row["symbol"], row["trade_date"]): row
+        for row in rows_by_dataset["tradability"]
+    }
+    for key in sorted(daily_keys):
+        daily = daily_by_key[key]
+        tradability = tradability_by_key[key]
+        close = Decimal(daily["close_raw"])
+        if tradability["is_suspended"] == "true" and (
+            Decimal(daily["volume"]) != 0 or Decimal(daily["amount"]) != 0
+        ):
+            raise SnapshotValidationError(
+                f"tradability key {key} suspended daily bar must have zero volume and amount"
+            )
+        limit_up = (
+            Decimal(tradability["limit_up"])
+            if tradability["limit_up"] != ""
+            else None
+        )
+        limit_down = (
+            Decimal(tradability["limit_down"])
+            if tradability["limit_down"] != ""
+            else None
+        )
+        if (limit_up is not None and close > limit_up) or (
+            limit_down is not None and close < limit_down
+        ):
+            raise SnapshotValidationError(
+                f"tradability key {key} close_raw is outside declared limit range"
+            )
+        for direction in ("up", "down"):
+            limit_text = tradability[f"limit_{direction}"]
+            flag = tradability[f"is_limit_{direction}"] == "true"
+            at_limit = limit_text != "" and close == Decimal(limit_text)
+            if flag != at_limit:
+                raise SnapshotValidationError(
+                    f"tradability key {key} is_limit_{direction} disagrees with close_raw"
+                )
+
     memberships: dict[str, list[tuple[date, date | None]]] = {}
     for row in rows_by_dataset["security_membership"]:
         memberships.setdefault(row["symbol"], []).append(
@@ -621,11 +1004,21 @@ def _validate_cross_dataset_contract(
             )
         )
 
+    for symbol, intervals in memberships.items():
+        ordered = sorted(intervals, key=lambda interval: interval[0])
+        previous_end: date | None = ordered[0][1]
+        for current_start, current_end in ordered[1:]:
+            if previous_end is None or current_start < previous_end:
+                raise SnapshotValidationError(
+                    f"symbol {symbol} has overlapping security membership intervals"
+                )
+            previous_end = current_end
+
     for symbol, trade_date_text in sorted(daily_keys):
         trade_date = date.fromisoformat(trade_date_text)
         intervals = memberships.get(symbol, [])
         is_covered = any(
-            start <= trade_date and (end is None or trade_date <= end)
+            start <= trade_date and (end is None or trade_date < end)
             for start, end in intervals
         )
         if not is_covered:
@@ -729,12 +1122,8 @@ def _canonical_value(value: Any, kind: str, *, nullable: bool, field: str) -> st
             integral = number.to_integral_value()
             if number != integral:
                 raise SnapshotValidationError(f"{field} must be an integer")
-            return str(integral)
-        if number == 0:
-            return "0"
-        normalized_number = number.normalize()
-        rendered = format(normalized_number, "f")
-        return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
+            return _render_decimal_exact(integral)
+        return _render_decimal_exact(number)
     raise SnapshotValidationError(f"unknown field type {kind!r} for {field}")
 
 
@@ -756,6 +1145,42 @@ def _parse_timestamp(value: Any, field: str) -> datetime:
             f"{field} must be an ISO timestamp with an explicit UTC offset"
         )
     return parsed.astimezone(timezone.utc)
+
+
+def _render_decimal_exact(number: Decimal) -> str:
+    """Render a finite Decimal without consulting the ambient context."""
+
+    if number.is_zero():
+        return "0"
+    parts = number.as_tuple()
+    digits = list(parts.digits)
+    exponent = int(parts.exponent)
+    while len(digits) > 1 and digits[-1] == 0:
+        digits.pop()
+        exponent += 1
+    coefficient = "".join(str(digit) for digit in digits)
+    decimal_point = len(coefficient) + exponent
+    if exponent >= 0:
+        plain_length = len(coefficient) + exponent
+    elif decimal_point > 0:
+        plain_length = len(coefficient) + 1
+    else:
+        plain_length = 2 + (-decimal_point) + len(coefficient)
+    sign = "-" if parts.sign else ""
+    if plain_length > 4096:
+        mantissa = coefficient[0]
+        if len(coefficient) > 1:
+            mantissa += "." + coefficient[1:]
+        scientific_exponent = exponent + len(coefficient) - 1
+        return f"{sign}{mantissa}e{scientific_exponent}"
+    if exponent >= 0:
+        rendered = coefficient + ("0" * exponent)
+    else:
+        if decimal_point > 0:
+            rendered = coefficient[:decimal_point] + "." + coefficient[decimal_point:]
+        else:
+            rendered = "0." + ("0" * -decimal_point) + coefficient
+    return sign + rendered
 
 
 def _format_timestamp(value: datetime) -> str:
@@ -832,6 +1257,7 @@ def _expected_snapshot_filenames() -> set[str]:
 
 
 __all__ = [
+    "ARTIFACT_NOTICE",
     "DATASET_CONTRACTS",
     "MANIFEST_FILENAME",
     "SCHEMA_VERSION",

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import copy
+import csv
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from decimal import localcontext
 from pathlib import Path
+from unittest.mock import patch
 
 from examples.build_research_snapshot import (
     FIXTURE_CUTOFF_TS,
@@ -41,6 +45,25 @@ def _canonical_json(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def _add_daily_bar_end_timestamps(datasets) -> None:
+    for row in datasets["daily_bar"]:
+        row["bar_end_at"] = f"{row['trade_date']}T15:00:00+08:00"
+
+
+def _market_row(datasets, dataset_name: str, symbol: str, trade_date: str):
+    return next(
+        row
+        for row in datasets[dataset_name]
+        if row["symbol"] == symbol and row.get("trade_date") == trade_date
+    )
+
+
+def _membership_row(datasets, symbol: str):
+    return next(
+        row for row in datasets["security_membership"] if row["symbol"] == symbol
+    )
+
+
 class ResearchSnapshotTest(unittest.TestCase):
     def _build(self, path: Path, datasets=None):
         return build_research_snapshot(
@@ -67,14 +90,14 @@ class ResearchSnapshotTest(unittest.TestCase):
             self.assertEqual(manifest["data_version"], FIXTURE_DATA_VERSION)
             self.assertEqual(
                 manifest["snapshot_id"],
-                "sha256:31aa3ced6519ca05aecca5accf7dc7cc4393d4c962dc4c0bc34b7d81dce9b926",
+                "sha256:0b7a9697ceccc81cf74e131b74e9377c106160919da990910725011ad39c342b",
             )
-            self.assertEqual(manifest["datasets"]["daily_bar"]["row_count"], 4)
+            self.assertEqual(manifest["datasets"]["daily_bar"]["row_count"], 6)
             self.assertEqual(
                 manifest["datasets"]["daily_bar"]["date_range"],
-                {"start": "2024-01-02", "end": "2024-01-03"},
+                {"start": "2024-01-02", "end": "2024-01-04"},
             )
-            self.assertEqual(manifest["datasets"]["fundamental_pit"]["row_count"], 2)
+            self.assertEqual(manifest["datasets"]["fundamental_pit"]["row_count"], 3)
 
             for name, metadata in manifest["datasets"].items():
                 payload = (root / metadata["path"]).read_bytes()
@@ -109,7 +132,10 @@ class ResearchSnapshotTest(unittest.TestCase):
             root = Path(tmp) / "snapshot"
             self._build(root)
             daily_path = root / "daily_bar.csv"
-            daily_path.write_bytes(daily_path.read_bytes().replace(b"1715", b"1716", 1))
+            original = daily_path.read_bytes()
+            tampered = original.replace(b"1728", b"1729", 1)
+            self.assertNotEqual(tampered, original)
+            daily_path.write_bytes(tampered)
 
             with self.assertRaisesRegex(SnapshotVerificationError, "SHA256 mismatch"):
                 verify_research_snapshot(root)
@@ -270,6 +296,465 @@ class ResearchSnapshotTest(unittest.TestCase):
             )
 
             self.assertEqual(json.loads(built.stdout), json.loads(verified.stdout))
+
+    def test_adjacent_decimals_beyond_context_precision_do_not_collide(self) -> None:
+        first_datasets = synthetic_datasets()
+        second_datasets = synthetic_datasets()
+        first_value = "1234567890123456789012345678901"
+        second_value = "1234567890123456789012345678902"
+        first_datasets["fundamental_pit"][0]["field_value"] = first_value
+        second_datasets["fundamental_pit"][0]["field_value"] = second_value
+
+        with tempfile.TemporaryDirectory() as tmp:
+            first_root = Path(tmp) / "first"
+            second_root = Path(tmp) / "second"
+            first_manifest = self._build(first_root, first_datasets)
+            second_manifest = self._build(second_root, second_datasets)
+            first_payload = (first_root / "fundamental_pit.csv").read_text(
+                encoding="utf-8"
+            )
+            second_payload = (second_root / "fundamental_pit.csv").read_text(
+                encoding="utf-8"
+            )
+
+            self.assertIn(first_value, first_payload)
+            self.assertIn(second_value, second_payload)
+            self.assertNotEqual(first_payload, second_payload)
+            self.assertNotEqual(
+                first_manifest["snapshot_id"], second_manifest["snapshot_id"]
+            )
+
+    def test_decimal_rendering_is_independent_of_ambient_context_precision(self) -> None:
+        datasets = synthetic_datasets()
+        exact_value = "123456789012345678901234567890.123456789"
+        datasets["fundamental_pit"][0]["field_value"] = exact_value
+
+        with tempfile.TemporaryDirectory() as tmp:
+            low_root = Path(tmp) / "low-precision"
+            high_root = Path(tmp) / "high-precision"
+            with localcontext() as context:
+                context.prec = 6
+                low_manifest = self._build(low_root, copy.deepcopy(datasets))
+            with localcontext() as context:
+                context.prec = 80
+                high_manifest = self._build(high_root, copy.deepcopy(datasets))
+
+            self.assertEqual(low_manifest["snapshot_id"], high_manifest["snapshot_id"])
+            self.assertEqual(
+                (low_root / "fundamental_pit.csv").read_bytes(),
+                (high_root / "fundamental_pit.csv").read_bytes(),
+            )
+            self.assertIn(
+                exact_value,
+                (low_root / "fundamental_pit.csv").read_text(encoding="utf-8"),
+            )
+
+    def test_integer_rendering_is_canonical_across_equivalent_exponents(self) -> None:
+        plain_datasets = synthetic_datasets()
+        exponent_datasets = synthetic_datasets()
+        exponent_datasets["tradability"][0]["lot_size"] = "1E+2"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plain_root = Path(tmp) / "plain"
+            exponent_root = Path(tmp) / "exponent"
+            plain_manifest = self._build(plain_root, plain_datasets)
+            exponent_manifest = self._build(exponent_root, exponent_datasets)
+
+            self.assertEqual(
+                (plain_root / "tradability.csv").read_bytes(),
+                (exponent_root / "tradability.csv").read_bytes(),
+            )
+            self.assertEqual(
+                plain_manifest["snapshot_id"], exponent_manifest["snapshot_id"]
+            )
+
+    def test_decimal_renderer_preserves_extreme_exponents_and_canonicalizes_negative_zero(
+        self,
+    ) -> None:
+        datasets = synthetic_datasets()
+        rows = datasets["fundamental_pit"]
+        rows[0]["field_name"] = "large_exact"
+        rows[0]["field_value"] = "1E+30"
+        rows[1]["field_name"] = "small_exact"
+        rows[1]["field_value"] = "1E-30"
+        negative_zero = copy.deepcopy(rows[0])
+        negative_zero["field_name"] = "negative_zero"
+        negative_zero["field_value"] = "-0E+20"
+        rows.append(negative_zero)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "snapshot"
+            self._build(root, datasets)
+            with (root / "fundamental_pit.csv").open(
+                encoding="utf-8", newline=""
+            ) as handle:
+                values = {
+                    row["field_name"]: row["field_value"]
+                    for row in csv.DictReader(handle)
+                }
+
+            self.assertEqual(values["large_exact"], "1000000000000000000000000000000")
+            self.assertEqual(values["small_exact"], "0.000000000000000000000000000001")
+            self.assertEqual(values["negative_zero"], "0")
+
+    def test_decimal_renderer_uses_exact_scientific_form_for_huge_exponents(
+        self,
+    ) -> None:
+        datasets = synthetic_datasets()
+        rows = datasets["fundamental_pit"]
+        rows[0]["field_name"] = "huge_positive_exponent"
+        rows[0]["field_value"] = "1E+100000"
+        rows[1]["field_name"] = "huge_negative_exponent"
+        rows[1]["field_value"] = "1E-100000"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "snapshot"
+            self._build(root, datasets)
+            with (root / "fundamental_pit.csv").open(
+                encoding="utf-8", newline=""
+            ) as handle:
+                values = {
+                    row["field_name"]: row["field_value"]
+                    for row in csv.DictReader(handle)
+                }
+
+            self.assertEqual(values["huge_positive_exponent"], "1e100000")
+            self.assertEqual(values["huge_negative_exponent"], "1e-100000")
+
+    def test_builder_requires_daily_bar_end_at(self) -> None:
+        datasets = synthetic_datasets()
+        datasets["daily_bar"][0].pop("bar_end_at", None)
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(SnapshotValidationError, "bar_end_at"):
+                self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_builder_rejects_daily_bar_end_without_timezone_offset(self) -> None:
+        datasets = synthetic_datasets()
+        _add_daily_bar_end_timestamps(datasets)
+        datasets["daily_bar"][0]["bar_end_at"] = "2024-01-03T15:00:00"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(SnapshotValidationError, "explicit UTC offset"):
+                self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_builder_rejects_daily_bar_end_on_different_trade_date(self) -> None:
+        datasets = synthetic_datasets()
+        _add_daily_bar_end_timestamps(datasets)
+        datasets["daily_bar"][0]["bar_end_at"] = "2024-01-04T15:00:00+08:00"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(SnapshotValidationError, "bar_end_at date"):
+                self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_builder_rejects_daily_bar_available_before_bar_end(self) -> None:
+        datasets = synthetic_datasets()
+        _add_daily_bar_end_timestamps(datasets)
+        datasets["daily_bar"][0]["available_at"] = "2024-01-03T14:59:59+08:00"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(
+                SnapshotValidationError, "available_at precedes bar_end_at"
+            ):
+                self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_builder_rejects_limit_up_not_above_limit_down(self) -> None:
+        datasets = synthetic_datasets()
+        tradability = _market_row(
+            datasets, "tradability", "600519.SH", "2024-01-03"
+        )
+        tradability["limit_up"] = "1700"
+        tradability["limit_down"] = "1700"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(
+                SnapshotValidationError, "limit_up must exceed limit_down"
+            ):
+                self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_builder_rejects_both_limit_flags_true(self) -> None:
+        datasets = synthetic_datasets()
+        tradability = _market_row(
+            datasets, "tradability", "600519.SH", "2024-01-03"
+        )
+        tradability.update(
+            {
+                "is_limit_up": True,
+                "is_limit_down": True,
+                "can_buy": False,
+                "can_sell": False,
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(
+                SnapshotValidationError, "limit flags are mutually exclusive"
+            ):
+                self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_builder_rejects_true_limit_up_flag_when_close_is_below_limit(self) -> None:
+        datasets = synthetic_datasets()
+        tradability = _market_row(
+            datasets, "tradability", "600519.SH", "2024-01-03"
+        )
+        tradability["is_limit_up"] = True
+        tradability["can_buy"] = False
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(
+                SnapshotValidationError, "is_limit_up disagrees with close_raw"
+            ):
+                self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_builder_rejects_false_limit_up_flag_when_close_equals_limit(self) -> None:
+        datasets = synthetic_datasets()
+        tradability = _market_row(
+            datasets, "tradability", "600519.SH", "2024-01-03"
+        )
+        daily = _market_row(datasets, "daily_bar", "600519.SH", "2024-01-03")
+        tradability["limit_up"] = daily["close_raw"]
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(
+                SnapshotValidationError, "is_limit_up disagrees with close_raw"
+            ):
+                self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_builder_rejects_false_limit_down_flag_when_close_equals_limit(self) -> None:
+        datasets = synthetic_datasets()
+        tradability = _market_row(
+            datasets, "tradability", "000001.SZ", "2024-01-02"
+        )
+        daily = _market_row(datasets, "daily_bar", "000001.SZ", "2024-01-02")
+        tradability["limit_down"] = daily["close_raw"]
+        tradability["is_limit_down"] = False
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(
+                SnapshotValidationError, "is_limit_down disagrees with close_raw"
+            ):
+                self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_builder_rejects_close_outside_declared_limit_range(self) -> None:
+        datasets = synthetic_datasets()
+        tradability = _market_row(
+            datasets, "tradability", "600519.SH", "2024-01-03"
+        )
+        tradability["limit_up"] = "1700"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(
+                SnapshotValidationError, "close_raw is outside declared limit range"
+            ):
+                self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_builder_rejects_suspended_bar_with_nonzero_volume(self) -> None:
+        datasets = synthetic_datasets()
+        tradability = _market_row(
+            datasets, "tradability", "000001.SZ", "2024-01-03"
+        )
+        tradability.update(
+            {"is_suspended": True, "can_buy": False, "can_sell": False}
+        )
+        daily = _market_row(datasets, "daily_bar", "000001.SZ", "2024-01-03")
+        daily["volume"] = "1"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(
+                SnapshotValidationError,
+                "suspended daily bar must have zero volume and amount",
+            ):
+                self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_builder_rejects_open_membership_for_delisted_security(self) -> None:
+        datasets = synthetic_datasets()
+        membership = _membership_row(datasets, "000001.SZ")
+        membership["delist_date"] = "2024-01-04"
+        membership["valid_to"] = None
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(
+                SnapshotValidationError, "delist_date requires exclusive valid_to"
+            ):
+                self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_builder_rejects_membership_extending_after_delist_date(self) -> None:
+        datasets = synthetic_datasets()
+        membership = _membership_row(datasets, "000001.SZ")
+        membership["delist_date"] = "2024-01-03"
+        membership["valid_to"] = "2024-01-04"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(
+                SnapshotValidationError, "valid_to cannot exceed delist_date"
+            ):
+                self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_builder_rejects_empty_exclusive_membership_interval(self) -> None:
+        datasets = synthetic_datasets()
+        membership = _membership_row(datasets, "000001.SZ")
+        membership["valid_to"] = membership["valid_from"]
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(
+                SnapshotValidationError, "valid_to must be after valid_from"
+            ):
+                self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_membership_valid_to_is_exclusive(self) -> None:
+        datasets = synthetic_datasets()
+        membership = _membership_row(datasets, "000001.SZ")
+        membership["valid_to"] = "2024-01-03"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(
+                SnapshotValidationError,
+                "2024-01-03.*no active security membership",
+            ):
+                self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_builder_rejects_overlapping_membership_intervals(self) -> None:
+        datasets = synthetic_datasets()
+        overlapping = copy.deepcopy(_membership_row(datasets, "600519.SH"))
+        overlapping["valid_from"] = "2024-01-01"
+        datasets["security_membership"].append(overlapping)
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(
+                SnapshotValidationError,
+                "overlapping security membership intervals",
+            ):
+                self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_builder_rejects_membership_start_before_listing(self) -> None:
+        datasets = synthetic_datasets()
+        membership = _membership_row(datasets, "000001.SZ")
+        membership["valid_from"] = "1991-04-02"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(
+                SnapshotValidationError, "valid_from precedes list_date"
+            ):
+                self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_verify_rejects_symlinked_dataset_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "snapshot"
+            self._build(root)
+            daily_path = root / "daily_bar.csv"
+            external = Path(tmp) / "external-daily.csv"
+            external.write_bytes(daily_path.read_bytes())
+            daily_path.unlink()
+            daily_path.symlink_to(external)
+
+            with self.assertRaisesRegex(SnapshotVerificationError, "regular file"):
+                verify_research_snapshot(root)
+
+    def test_verify_rejects_hardlinked_dataset_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "snapshot"
+            self._build(root)
+            daily_path = root / "daily_bar.csv"
+            external = Path(tmp) / "external-daily.csv"
+            external.write_bytes(daily_path.read_bytes())
+            daily_path.unlink()
+            os.link(external, daily_path)
+
+            with self.assertRaisesRegex(SnapshotVerificationError, "hard link"):
+                verify_research_snapshot(root)
+
+    def test_publisher_preserves_concurrent_entry_and_cleans_only_owned_files(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "snapshot"
+            intruder_payload = b"not-created-by-the-snapshot-builder\n"
+            original_mkdir = Path.mkdir
+
+            def mkdir_with_concurrent_entry(path, *args, **kwargs):
+                result = original_mkdir(path, *args, **kwargs)
+                if path == root:
+                    (root / "fundamental_pit.csv").write_bytes(intruder_payload)
+                return result
+
+            with patch.object(Path, "mkdir", new=mkdir_with_concurrent_entry):
+                with self.assertRaisesRegex(
+                    SnapshotImmutableError, "concurrent entry"
+                ):
+                    self._build(root)
+
+            self.assertEqual(
+                (root / "fundamental_pit.csv").read_bytes(), intruder_payload
+            )
+            self.assertFalse((root / "daily_bar.csv").exists())
+
+    def test_fixture_manifest_labels_contract_demo_as_non_performance_evidence(
+        self,
+    ) -> None:
+        expected_notice = (
+            "Deterministic synthetic format/contract demonstration; not market data, "
+            "strategy, or performance evidence."
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "snapshot"
+            manifest = run(root)
+
+            self.assertEqual(manifest.get("artifact_notice"), expected_notice)
+            self.assertEqual(manifest["source"], "deterministic_synthetic_fixture")
+
+    def test_fixture_has_three_contiguous_sessions_and_a_next_session_fill_path(
+        self,
+    ) -> None:
+        datasets = synthetic_datasets()
+        trade_dates = sorted(
+            {row["trade_date"] for row in datasets["daily_bar"]}
+        )
+
+        self.assertEqual(trade_dates, ["2024-01-02", "2024-01-03", "2024-01-04"])
+        jan_four = [
+            row
+            for row in datasets["tradability"]
+            if row["trade_date"] == "2024-01-04"
+        ]
+        self.assertTrue(any(row["can_buy"] for row in jan_four))
+
+    def test_fixture_contains_st_suspension_and_both_limit_directions(self) -> None:
+        datasets = synthetic_datasets()
+        rows = datasets["tradability"]
+
+        self.assertTrue(any(row["is_st"] for row in rows))
+        self.assertTrue(any(row["is_suspended"] for row in rows))
+        self.assertTrue(any(row["is_limit_up"] for row in rows))
+        self.assertTrue(any(row["is_limit_down"] for row in rows))
+        for tradability in (row for row in rows if row["is_suspended"]):
+            daily = _market_row(
+                datasets,
+                "daily_bar",
+                tradability["symbol"],
+                tradability["trade_date"],
+            )
+            self.assertFalse(tradability["can_buy"])
+            self.assertFalse(tradability["can_sell"])
+            self.assertEqual(daily["volume"], "0")
+            self.assertEqual(daily["amount"], "0")
+
+    def test_fixture_contains_pre_signal_fundamental_and_later_revision(self) -> None:
+        datasets = synthetic_datasets()
+        rows = [
+            row
+            for row in datasets["fundamental_pit"]
+            if row["symbol"] == "600519.SH"
+            and row["field_name"] == "roe_ttm"
+            and row["report_period_end"] == "2023-09-30"
+        ]
+        by_revision = {row["revision_id"]: row for row in rows}
+
+        self.assertEqual(set(by_revision), {"original", "restatement-1"})
+        self.assertEqual(
+            by_revision["original"]["available_at"],
+            "2023-10-23T09:00:00+08:00",
+        )
+        self.assertEqual(
+            by_revision["restatement-1"]["available_at"],
+            "2024-01-04T09:00:00+08:00",
+        )
+        self.assertTrue(by_revision["restatement-1"]["is_restated"])
+
+    def test_fixture_contains_legal_exclusive_delisting_boundary(self) -> None:
+        datasets = synthetic_datasets()
+        membership = _membership_row(datasets, "000001.SZ")
+        symbol_dates = [
+            row["trade_date"]
+            for row in datasets["daily_bar"]
+            if row["symbol"] == "000001.SZ"
+        ]
+
+        self.assertEqual(membership["valid_to"], membership["delist_date"])
+        self.assertIsNotNone(membership["valid_to"])
+        self.assertTrue(all(day < membership["valid_to"] for day in symbol_dates))
 
 
 if __name__ == "__main__":
