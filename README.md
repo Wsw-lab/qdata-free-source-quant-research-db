@@ -12,12 +12,13 @@ QData 是一个 A 股研究数据工程原型。当前可在无网络、无 Dock
 | 本地 Python SDK | 已实现 | 默认 mock 后端可离线查询证券、日历、价格、交易约束、PIT 基本面、指数/行业、股票池、因子和健康信息。 |
 | 因子 API 时序算术 | 已实现 | 收盘后信号 → 下一交易日开盘成交 → 当日收盘计值；只验证 API/时序对齐，不代表回测、收益或交易建议。 |
 | 质量、版本与批次语义 | 单元验证 | 严格完整率门禁、显式分钟频率失败、PIT/版本过滤、不可变版本和批次生命周期由确定性 fake/unit test 覆盖。 |
-| PostgreSQL/ClickHouse 后端 | 待集成验证 | SQL、迁移和 loopback-only Compose 配置存在，但真实数据库执行、跨库失败恢复、性能及长期运行尚未由本分支的绿色路径验证。 |
+| ClickHouse vintage 迁移 selector | 本地集成验证 | 已在本地 Docker 的 ClickHouse 24.8.14.39 上，以 fresh old-key full schemas 和 four source rows in one old-key part（四行位于一个旧键 part）跑通 create-copy-EXCHANGE、old-key backup 及 OPTIMIZE FINAL 后验证。该证据只覆盖迁移 selector，不覆盖生产运行；CI does not run database integration。 |
+| PostgreSQL 与跨存储路径 | 待真实集成验证 | PostgreSQL array binding、query plans、cross-store transactions，以及数据库故障恢复、性能和长期运行仍未由真实集成环境验证。 |
 | 免费数据源适配 | 研究候选 | 覆盖、稳定性、限频、服务承诺、许可和再分发权取决于上游；商业或生产使用前必须单独完成法律、合同、覆盖和 SLA 审查。 |
 
 ## 全新 checkout 的唯一离线绿色路径
 
-前置条件：Python 3.9+。在仓库根目录执行：
+前置条件：Python 3.9–3.12。在仓库根目录执行：
 
 ```bash
 snapshot_root="$(mktemp -d)"
@@ -25,11 +26,11 @@ python3 examples/build_research_snapshot.py build "$snapshot_root/research_snaps
 python3 examples/build_research_snapshot.py verify "$snapshot_root/research_snapshot_v1"
 
 python3 examples/quickstart.py
-python3 examples/factor_backtest_demo.py
+python3 examples/factor_api_arithmetic_demo.py
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-这条路径直接从 checkout 导入仓库代码，不启动数据库、不调用外部数据源，也不需要付费凭据。snapshot build 不会覆盖不同内容的既有目录；verify 会重新校验文件集合、内容哈希和合约语义。CI 在 Python 3.9、3.10、3.11 和 3.12 上额外执行本地 editable install，并运行全量 unittest、两个公开示例及 snapshot build/verify/repeatability 检查。
+这条路径直接从 checkout 导入仓库代码，不启动数据库、不调用外部数据源，也不需要付费凭据。snapshot build 不会覆盖不同内容的既有目录；verify 会重新校验文件集合、内容哈希和合约语义。CI workflow 配置为在 Python 3.9、3.10、3.11 和 3.12 上先固定 packaging toolchain，再离线执行本地 editable install、全量 unittest、两个公开示例及 snapshot build/verify/repeatability 检查；这里不声称远端 GitHub CI 已实际运行。
 
 ## `research_snapshot_v1` 优先工作流
 
@@ -58,7 +59,7 @@ python3 examples/quickstart.py
 ## 收盘后信号 → 下一开盘算术
 
 ```bash
-python3 examples/factor_backtest_demo.py
+python3 examples/factor_api_arithmetic_demo.py
 ```
 
 示例的时间轴是：
@@ -82,7 +83,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 聚焦验证公开时序算术：
 
 ```bash
-python3 -m unittest -v tests.test_factor_backtest_demo
+python3 -m unittest -v tests.test_factor_api_arithmetic_demo
 ```
 
 本 README 不记录易过期的测试数量；以当前命令输出和 CI 为准。
@@ -95,12 +96,12 @@ python3 -m unittest -v tests.test_factor_backtest_demo
 docker compose config --quiet
 ```
 
-数据库容器、迁移和 SQL backend 不属于上面的离线绿色路径。若要评估它们，应另外运行真实 PostgreSQL/ClickHouse 集成、迁移、失败注入和性能测试。尤其要注意：修正 ClickHouse sorting key 的迁移只能保护未来 merge；旧 key 已经合并丢失的 vintage 无法由迁移恢复，只能从保留的源数据或历史已验证 snapshot 重建。
+数据库容器、迁移和 SQL backend 不属于上面的离线绿色路径。ClickHouse migration selector 已在本地 Docker 的 ClickHouse 24.8.14.39 上，用 fresh old-key full schemas 与 four source rows in one old-key part（四行位于一个旧键 part）验证 create-copy-EXCHANGE、old-key backup 和 OPTIMIZE FINAL；这不是整套后端的生产验证。PostgreSQL array binding、query plans、cross-store transactions 仍需真实集成测试，且 CI does not run database integration。尤其要注意：修正 ClickHouse sorting key 的迁移只能保护未来 merge；旧 key 已经合并丢失的 vintage 无法由迁移恢复，只能从保留的源数据或历史已验证 snapshot 重建。
 
 ## 项目边界
 
 - 当前交付物是研究数据工程原型，不是商业级行情再分发或生产 SLA 承诺。
 - mock 和 synthetic fixture 只证明确定性接口与合约行为，不证明覆盖率、正确率、可交易性或投资收益。
 - 免费/公开源的许可、条款、归属、缓存、再分发、覆盖、限频和 SLA 必须逐源复核。
-- 真实 PostgreSQL/ClickHouse 集成仍是待验证项；单元测试中的 fake 不能替代数据库语义和跨存储故障测试。
+- 除上述 ClickHouse migration selector 的限定证据外，真实 PostgreSQL 数据访问、查询计划、跨存储事务和完整后端运行仍待验证；单元测试中的 fake 不能替代这些语义。
 - `.env`、本地报告、构建产物和生成型研究输出默认不进入版本控制；凭据不得提交。

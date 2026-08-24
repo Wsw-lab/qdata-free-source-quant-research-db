@@ -45,16 +45,16 @@
       </div>
       <div class="metric-grid">
         <div class="metric">
-          <strong>291</strong>
-          <span>unit tests passing across SDK, database, worker, API and console paths</span>
+          <strong>Offline</strong>
+          <span>deterministic unittest command for SDK, fake-backend, worker, API and console behavior</span>
         </div>
         <div class="metric">
-          <strong>73</strong>
-          <span>Upsilon admin console smoke markers rendered from a local API server</span>
+          <strong>Local-only</strong>
+          <span>console smoke requires an explicitly started local API service</span>
         </div>
         <div class="metric">
-          <strong>9</strong>
-          <span>free-source candidates tracked with reliability and admission metadata</span>
+          <strong>Candidates</strong>
+          <span>free-source adapters require source-by-source legal, coverage and SLA review</span>
         </div>
         <div class="metric">
           <strong>0 RMB</strong>
@@ -100,21 +100,18 @@
           <h3>Local Verification</h3>
           <div class="proof">
             <b>Unit test suite</b>
-            <code>python3 -m unittest discover -s tests
-Ran 291 tests ... OK</code>
+            <code>python3 -m unittest discover -s tests -p 'test_*.py'
+Use the current command output as evidence</code>
           </div>
           <div class="proof">
             <b>Console smoke</b>
             <code>python3 scripts/smoke_upsilon_console.py --base-url http://127.0.0.1:18080 --token devtoken
-upsilon_console=ok html_bytes=807462 markers=73</code>
+Run separately; use the current command output as evidence</code>
           </div>
           <div class="proof">
             <b>Core API smoke</b>
-            <code>health=ok rows=1
-price=ok rows=2
-constraints=ok rows=2
-tradable=ok rows=2
-matrix_csv=ok lines=2</code>
+            <code>Optional integration check outside the offline green path
+Use the current command output as evidence</code>
           </div>
         </div>
       </div>

@@ -43,8 +43,14 @@ contract is requested by a caller that accepts it.
   backfills; strict research must not pretend they were observed historically.
 - Storage and query backends may evolve independently as long as the exported
   snapshot contract and hashes remain stable.
-- Real PostgreSQL/ClickHouse integration tests are still required in addition
-  to deterministic unit fixtures.
+- The ClickHouse migration selector was locally integration-tested in Docker on
+  ClickHouse 24.8.14.39 with fresh old-key full schemas and four source rows in one old-key part,
+  covering create-copy-EXCHANGE, old-key backup, and OPTIMIZE FINAL. This is
+  bounded migration evidence, not a production-backend claim.
+- CI does not run database integration.
+- PostgreSQL array binding, query plans, cross-store transactions, failure
+  recovery, performance, and sustained operation still require real integration
+  tests in addition to deterministic unit fixtures.
 - A ClickHouse migration can preserve vintages for future merges, but it cannot
   reconstruct rows already collapsed under an older sorting key. Those rows
   must be restored from retained source data or an earlier verified snapshot.

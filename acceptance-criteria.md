@@ -1192,7 +1192,7 @@
 
 | 用例 | 命令 | 预期结果 |
 |---|---|---|
-| 单元测试 | `python3 -m unittest discover -s tests` | 291 个测试通过 |
+| 单元测试 | `python3 -m unittest discover -s tests` | 以当前命令输出为准，不固定易过期数量 |
 | CSV 全市场样例 | `./scripts/run_daily_pipeline.py --provider csv --all-market --job-code daily_market_csv_all --trade-date 2024-01-04 --batch-size 1 --force` | `partial_success`，expected=3，rows=2，missing=1 |
 | CSV 非交易日 | `./scripts/run_daily_pipeline.py --provider csv --all-market --job-code daily_market_csv_all --trade-date 2024-01-05 --batch-size 1 --force` | `skipped` |
 | CSV 生产 smoke | `./scripts/smoke_full_market_daily.py --job-code daily_market_csv_all --trade-date 2024-01-04 --symbols 600519.SH,000001.SZ` | 输出 `missing_symbols=300750.SZ`，health 为当前 job 的 2 条 warning |

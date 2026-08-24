@@ -1544,7 +1544,7 @@ npx --yes playwright screenshot --full-page --viewport-size=390,900 --wait-for-s
 - CLI/smoke：新增 `scripts/run_eta6_vendor_production_source.py` 和 `scripts/smoke_eta6_vendor_production_source.py`；支持 run、runs、dataset-checks、decisions 查询。
 - Kappa/Upsilon：新增 production source runs、dataset checks、decisions 三个 GET endpoint；overview 新增 production source count/ready/blocked/status/role/score/live env 指标，Vendor tab 展示三张 Eta-6 表。
 - Docker PostgreSQL 已应用 0055，重复执行 migration 输出 `Detected applied PostgreSQL migration prefix: 0055` 并跳过旧迁移。
-- 单元测试输出 `Ran 291 tests ... OK`；Eta-6 专项测试输出 `Ran 3 tests ... OK`。
+- 单元测试和 Eta-6 专项测试的历史运行均通过；当前证据必须重新执行相应命令，不沿用易过期的测试数量。
 - Eta-6 smoke 输出 `eta6_vendor_production_source_smoke=ok status=blocked role=blocked datasets=7 production_ready=0 blocked=7 decisions=63 live_base_url_present=False live_token_present=True score=12.5000`。
 - Eta-6 CLI 查询返回真实证据：runs、dataset-checks、decisions 均 `rows=1`，输出只包含状态、计数、阻断原因和脱敏字段，不暴露 token 原文。
 - Eta-6 Worker dry-run 输出 `task name=vendor_production_source_closure status=skipped processed=7 success=0 warning=7 failed=0`；非 dry-run 输出 `task name=vendor_production_source_closure status=warning processed=7 success=0 warning=7 failed=0`。

@@ -1,9 +1,9 @@
 import unittest
 
-from examples.factor_backtest_demo import run_demo
+from examples.factor_api_arithmetic_demo import run_demo
 
 
-class FactorBacktestDemoTest(unittest.TestCase):
+class FactorApiArithmeticDemoTest(unittest.TestCase):
     def test_demo_uses_after_close_signal_and_next_open_arithmetic(self) -> None:
         result = run_demo()
 

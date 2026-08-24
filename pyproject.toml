@@ -7,7 +7,7 @@ name = "qdata"
 version = "0.1.0"
 description = "A-share quantitative financial data SDK prototype"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.9,<3.13"
 authors = [
   { name = "Quant Data Platform" }
 ]

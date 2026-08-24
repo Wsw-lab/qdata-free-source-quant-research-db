@@ -12,12 +12,13 @@ QData is an A-share research data-engineering prototype. Its Python SDK, `resear
 | Local Python SDK | Implemented | The default mock backend queries securities, calendars, prices, trading constraints, PIT fundamentals, index/industry membership, universes, factors, and health data offline. |
 | Factor API timing arithmetic | Implemented | After-close signal → next-session-open fill → same-session-close mark. This verifies API/time alignment only; it is not a backtest, return claim, or trading recommendation. |
 | Quality, version, and batch semantics | Unit-verified | Deterministic fake/unit tests cover strict completeness, explicit unsupported minute data, PIT/version filtering, immutable versions, and the batch lifecycle. |
-| PostgreSQL/ClickHouse backend | Integration pending | SQL, migrations, and a loopback-only Compose topology exist, but real database execution, cross-store failure recovery, performance, and sustained operation are not green-path claims on this branch. |
+| ClickHouse vintage migration selector | Locally integration-tested | Local Docker with ClickHouse 24.8.14.39 covered fresh old-key full schemas and four source rows in one old-key part through create-copy-EXCHANGE, old-key backup, and post-migration OPTIMIZE FINAL checks. This evidence is limited to the migration selector, not production operation; CI does not run database integration. |
+| PostgreSQL and cross-store paths | Real integration pending | PostgreSQL array binding, query plans, cross-store transactions, database failure recovery, performance, and sustained operation remain unverified in a real integration environment. |
 | Free-source adapters | Research candidates | Coverage, stability, rate limits, service levels, licensing, and redistribution rights depend on each upstream source. Legal, contract, coverage, and SLA review is required before commercial or production use. |
 
 ## The one offline green path from a fresh checkout
 
-Prerequisite: Python 3.9+. Run from the repository root:
+Prerequisite: Python 3.9–3.12. Run from the repository root:
 
 ```bash
 snapshot_root="$(mktemp -d)"
@@ -25,11 +26,11 @@ python3 examples/build_research_snapshot.py build "$snapshot_root/research_snaps
 python3 examples/build_research_snapshot.py verify "$snapshot_root/research_snapshot_v1"
 
 python3 examples/quickstart.py
-python3 examples/factor_backtest_demo.py
+python3 examples/factor_api_arithmetic_demo.py
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-This path imports repository code directly from the checkout, starts no databases, calls no external data sources, and needs no paid credentials. Snapshot build refuses to overwrite different content; verify rechecks the file set, content hashes, and contract semantics. CI additionally performs a local editable install and runs the full unittest suite, both public examples, and snapshot build/verify/repeatability checks on Python 3.9, 3.10, 3.11, and 3.12.
+This path imports repository code directly from the checkout, starts no databases, calls no external data sources, and needs no paid credentials. Snapshot build refuses to overwrite different content; verify rechecks the file set, content hashes, and contract semantics. The CI workflow is configured to pin its packaging toolchain and then perform the local editable install offline, followed by the full unittest suite, both public examples, and snapshot build/verify/repeatability checks on Python 3.9, 3.10, 3.11, and 3.12. This is a workflow description, not a claim that hosted GitHub CI has run.
 
 ## `research_snapshot_v1` first
 
@@ -58,7 +59,7 @@ This uses the default mock backend to demonstrate the SDK query shape and explic
 ## After-close signal → next-open arithmetic
 
 ```bash
-python3 examples/factor_backtest_demo.py
+python3 examples/factor_api_arithmetic_demo.py
 ```
 
 The example timeline is:
@@ -82,7 +83,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 Run the focused public timing-arithmetic contract:
 
 ```bash
-python3 -m unittest -v tests.test_factor_backtest_demo
+python3 -m unittest -v tests.test_factor_api_arithmetic_demo
 ```
 
 This README deliberately avoids a test-count claim that will go stale; use current command output and CI as evidence.
@@ -95,12 +96,12 @@ This README deliberately avoids a test-count claim that will go stale; use curre
 docker compose config --quiet
 ```
 
-The database containers, migrations, and SQL backend are outside the offline green path. Evaluating them requires separate real PostgreSQL/ClickHouse integration, migration, fault-injection, and performance tests. In particular, a migration that fixes a ClickHouse sorting key protects future merges only; vintages already collapsed under the old key cannot be recovered by that migration and must be rebuilt from retained source data or an earlier verified snapshot.
+The database containers, migrations, and SQL backend are outside the offline green path. The ClickHouse migration selector was locally exercised in Docker on ClickHouse 24.8.14.39 using fresh old-key full schemas and four source rows in one old-key part, including create-copy-EXCHANGE, old-key backup, and OPTIMIZE FINAL. This is not end-to-end production-backend evidence. PostgreSQL array binding, query plans, and cross-store transactions still need real integration testing, and CI does not run database integration. In particular, a migration that fixes a ClickHouse sorting key protects future merges only; vintages already collapsed under the old key cannot be recovered by that migration and must be rebuilt from retained source data or an earlier verified snapshot.
 
 ## Project boundaries
 
 - This deliverable is a research data-engineering prototype, not commercial market-data redistribution or a production SLA.
 - Mock and synthetic fixtures prove deterministic interface and contract behavior only; they do not prove coverage, accuracy, tradability, or investment returns.
 - Licensing, terms, attribution, caching, redistribution, coverage, rate limits, and SLAs must be reviewed source by source for free/public providers.
-- Real PostgreSQL/ClickHouse integration remains pending; unit-test fakes do not replace database semantics or cross-store failure testing.
+- Apart from the bounded ClickHouse migration-selector evidence above, real PostgreSQL access, query planning, cross-store transactions, and complete backend operation remain pending; unit-test fakes do not replace those semantics.
 - `.env`, local reports, build artifacts, and generated research outputs are ignored by default; credentials must not be committed.

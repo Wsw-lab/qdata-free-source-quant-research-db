@@ -18,4 +18,4 @@ Project companion files in the repository:
 - Architecture diagram: `assets/qdata-architecture.svg`
 - Architecture note: `architecture.md`
 - Notebook: `../notebooks/free_source_factor_backtest.ipynb`
-- Backtest demo: `../examples/factor_backtest_demo.py`
+- Factor API arithmetic demo: `../examples/factor_api_arithmetic_demo.py`
