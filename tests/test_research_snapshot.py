@@ -46,6 +46,32 @@ def _canonical_json(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def _rewrite_and_resign_dataset(
+    root: Path,
+    dataset_name: str,
+    old_value: bytes,
+    new_value: bytes,
+) -> None:
+    dataset_path = root / f"{dataset_name}.csv"
+    original_payload = dataset_path.read_bytes()
+    rewritten_payload = original_payload.replace(old_value, new_value, 1)
+    if rewritten_payload == original_payload:
+        raise AssertionError(f"fixture value not found in {dataset_name}.csv")
+    dataset_path.write_bytes(rewritten_payload)
+
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["datasets"][dataset_name]["sha256"] = hashlib.sha256(
+        rewritten_payload
+    ).hexdigest()
+    manifest_without_id = dict(manifest)
+    manifest_without_id.pop("snapshot_id")
+    manifest["snapshot_id"] = "sha256:" + hashlib.sha256(
+        _canonical_json(manifest_without_id)
+    ).hexdigest()
+    manifest_path.write_bytes(_canonical_json(manifest))
+
+
 def _add_daily_bar_end_timestamps(datasets) -> None:
     for row in datasets["daily_bar"]:
         row["bar_end_at"] = f"{row['trade_date']}T15:00:00+08:00"
@@ -57,6 +83,15 @@ def _market_row(datasets, dataset_name: str, symbol: str, trade_date: str):
         for row in datasets[dataset_name]
         if row["symbol"] == symbol and row.get("trade_date") == trade_date
     )
+
+
+def _remove_market_key(datasets, symbol: str, trade_date: str) -> None:
+    for dataset_name in ("daily_bar", "tradability"):
+        datasets[dataset_name] = [
+            row
+            for row in datasets[dataset_name]
+            if (row["symbol"], row["trade_date"]) != (symbol, trade_date)
+        ]
 
 
 def _membership_row(datasets, symbol: str):
@@ -183,6 +218,30 @@ class ResearchSnapshotTest(unittest.TestCase):
             with self.assertRaisesRegex(SnapshotVerificationError, "exceeds cutoff_ts"):
                 verify_research_snapshot(root)
 
+    def test_verify_rejects_resigned_next_local_date_signal_inputs(self) -> None:
+        cases = {
+            "daily_bar": b"2024-01-03T07:05:00Z",
+            "tradability": b"2024-01-03T01:15:00Z",
+        }
+
+        for dataset_name, original_available_at in cases.items():
+            with self.subTest(dataset_name=dataset_name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp) / "snapshot"
+                    self._build(root)
+                    _rewrite_and_resign_dataset(
+                        root,
+                        dataset_name,
+                        original_available_at,
+                        b"2024-01-03T16:05:00Z",
+                    )
+
+                    with self.assertRaisesRegex(
+                        SnapshotVerificationError,
+                        "signal_available_at local date 2024-01-04.*trade_date 2024-01-03",
+                    ):
+                        verify_research_snapshot(root)
+
     def test_verify_rejects_unknown_schema_even_with_canonical_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "snapshot"
@@ -228,6 +287,98 @@ class ResearchSnapshotTest(unittest.TestCase):
         datasets["tradability"].pop()
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(SnapshotValidationError, "keys must match"):
+                self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_builder_rejects_jointly_missing_active_membership_market_key(
+        self,
+    ) -> None:
+        datasets = synthetic_datasets()
+        _remove_market_key(datasets, "600519.SH", "2024-01-03")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(
+                SnapshotValidationError,
+                "missing explicit daily_bar/tradability coverage.*600519.SH.*2024-01-03",
+            ):
+                self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_builder_does_not_require_market_keys_outside_membership_interval(
+        self,
+    ) -> None:
+        cases = {
+            "before_new_listing": {
+                "membership": {
+                    "list_date": "2024-01-03",
+                    "valid_from": "2024-01-03",
+                },
+                "removed_dates": ("2024-01-02",),
+            },
+            "exclusive_valid_to_and_after": {
+                "membership": {
+                    "delist_date": "2024-01-03",
+                    "valid_to": "2024-01-03",
+                },
+                "removed_dates": ("2024-01-03", "2024-01-04"),
+            },
+        }
+
+        for case_name, case in cases.items():
+            with self.subTest(case_name=case_name):
+                datasets = synthetic_datasets()
+                membership = _membership_row(datasets, "000001.SZ")
+                membership.update(case["membership"])
+                for trade_date in case["removed_dates"]:
+                    _remove_market_key(datasets, "000001.SZ", trade_date)
+
+                with tempfile.TemporaryDirectory() as tmp:
+                    manifest = self._build(Path(tmp) / "snapshot", datasets)
+
+                self.assertEqual(manifest["schema_version"], SCHEMA_VERSION)
+
+    def test_builder_allows_membership_only_symbol_outside_market_date_range(
+        self,
+    ) -> None:
+        datasets = synthetic_datasets()
+        datasets["security_membership"].append(
+            {
+                "symbol": "300001.SZ",
+                "list_date": "2024-01-05",
+                "delist_date": None,
+                "valid_from": "2024-01-05",
+                "valid_to": None,
+                "board": "CHINEXT",
+                "asset_type": "stock",
+                "status": "active",
+                "available_at": "2024-01-04T18:00:00+08:00",
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self._build(Path(tmp) / "snapshot", datasets)
+
+        self.assertEqual(manifest["datasets"]["security_membership"]["row_count"], 3)
+
+    def test_builder_rejects_active_membership_only_symbol(self) -> None:
+        datasets = synthetic_datasets()
+        datasets["security_membership"].append(
+            {
+                "symbol": "300001.SZ",
+                "list_date": "2024-01-02",
+                "delist_date": None,
+                "valid_from": "2024-01-02",
+                "valid_to": None,
+                "board": "CHINEXT",
+                "asset_type": "stock",
+                "status": "active",
+                "available_at": "2024-01-01T18:00:00+08:00",
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(
+                SnapshotValidationError,
+                "missing explicit daily_bar/tradability coverage.*300001.SZ.*2024-01-02",
+            ):
                 self._build(Path(tmp) / "snapshot", datasets)
 
     def test_builder_rejects_uncovered_historical_membership(self) -> None:
@@ -454,6 +605,90 @@ class ResearchSnapshotTest(unittest.TestCase):
                 SnapshotValidationError, "available_at precedes bar_end_at"
             ):
                 self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_builder_rejects_daily_bar_available_on_next_manifest_local_date(
+        self,
+    ) -> None:
+        datasets = synthetic_datasets()
+        daily = _market_row(datasets, "daily_bar", "600519.SH", "2024-01-03")
+        daily["available_at"] = "2024-01-03T16:05:00Z"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(
+                SnapshotValidationError,
+                "signal_available_at local date 2024-01-04.*trade_date 2024-01-03",
+            ):
+                self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_builder_rejects_tradability_available_on_next_manifest_local_date(
+        self,
+    ) -> None:
+        datasets = synthetic_datasets()
+        tradability = _market_row(
+            datasets, "tradability", "600519.SH", "2024-01-03"
+        )
+        tradability["available_at"] = "2024-01-03T16:05:00Z"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(
+                SnapshotValidationError,
+                "signal_available_at local date 2024-01-04.*trade_date 2024-01-03",
+            ):
+                self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_builder_rejects_report_period_after_each_disclosure_local_date(
+        self,
+    ) -> None:
+        cases = {
+            "published_at": {
+                "published_at": "2024-01-03T23:30:00+08:00",
+                "first_seen_at": "2024-01-04T00:05:00+08:00",
+                "available_at": "2024-01-04T00:10:00+08:00",
+            },
+            "first_seen_at": {
+                "published_at": "2024-01-04T00:01:00+08:00",
+                "first_seen_at": "2024-01-03T23:30:00+08:00",
+                "available_at": "2024-01-04T00:10:00+08:00",
+            },
+            "available_at": {
+                "published_at": "2024-01-03T23:00:00+08:00",
+                "first_seen_at": "2024-01-03T23:30:00+08:00",
+                "available_at": "2024-01-03T23:45:00+08:00",
+            },
+        }
+
+        for field, timestamps in cases.items():
+            with self.subTest(field=field):
+                datasets = synthetic_datasets()
+                fundamental = datasets["fundamental_pit"][0]
+                fundamental["report_period_end"] = "2024-01-04"
+                fundamental.update(timestamps)
+
+                with tempfile.TemporaryDirectory() as tmp:
+                    with self.assertRaisesRegex(
+                        SnapshotValidationError,
+                        rf"report_period_end 2024-01-04.*{field} local date 2024-01-03",
+                    ):
+                        self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_builder_uses_manifest_local_date_for_fundamental_disclosures(
+        self,
+    ) -> None:
+        datasets = synthetic_datasets()
+        fundamental = datasets["fundamental_pit"][0]
+        fundamental.update(
+            {
+                "report_period_end": "2024-01-04",
+                "published_at": "2024-01-03T16:00:00Z",
+                "first_seen_at": "2024-01-03T16:05:00Z",
+                "available_at": "2024-01-03T16:10:00Z",
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self._build(Path(tmp) / "snapshot", datasets)
+
+        self.assertEqual(manifest["timezone"], "Asia/Shanghai")
 
     def test_builder_rejects_limit_up_not_above_limit_down(self) -> None:
         datasets = synthetic_datasets()

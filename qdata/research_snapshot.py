@@ -244,6 +244,9 @@ def build_research_snapshot(
         snapshot_timezone=ZoneInfo(canonical_timezone),
     )
     _validate_cross_dataset_contract(rows_by_dataset)
+    _validate_signal_availability_dates(
+        rows_by_dataset, ZoneInfo(canonical_timezone)
+    )
 
     file_payloads: dict[str, bytes] = {}
     dataset_metadata: dict[str, dict[str, Any]] = {}
@@ -431,6 +434,9 @@ def verify_research_snapshot(
 
         try:
             _validate_cross_dataset_contract(rows_by_dataset)
+            _validate_signal_availability_dates(
+                rows_by_dataset, ZoneInfo(timezone_name)
+            )
         except SnapshotValidationError as exc:
             raise SnapshotVerificationError(str(exc)) from exc
 
@@ -976,6 +982,22 @@ def _validate_row_semantics(
         published_at = _parse_timestamp(row["published_at"], "published_at")
         first_seen_at = _parse_timestamp(row["first_seen_at"], "first_seen_at")
         available_at = _parse_timestamp(row["available_at"], "available_at")
+        report_period_end = date.fromisoformat(row["report_period_end"])
+        disclosure_dates = (
+            ("published_at", published_at.astimezone(snapshot_timezone).date()),
+            ("first_seen_at", first_seen_at.astimezone(snapshot_timezone).date()),
+            ("available_at", available_at.astimezone(snapshot_timezone).date()),
+        )
+        later_than = [
+            f"{field} local date {local_date.isoformat()}"
+            for field, local_date in disclosure_dates
+            if report_period_end > local_date
+        ]
+        if later_than:
+            raise SnapshotValidationError(
+                f"fundamental_pit row {index} report_period_end "
+                f"{report_period_end.isoformat()} is later than {', '.join(later_than)}"
+            )
         if available_at < max(published_at, first_seen_at):
             raise SnapshotValidationError(
                 f"fundamental_pit row {index} available_at precedes publication or ingestion"
@@ -1062,6 +1084,27 @@ def _validate_cross_dataset_contract(
                 )
             previous_end = current_end
 
+    market_dates = [
+        (date.fromisoformat(trade_date_text), trade_date_text)
+        for trade_date_text in sorted({key[1] for key in daily_keys})
+    ]
+    missing_membership_keys = [
+        (symbol, market_date_text)
+        for symbol, intervals in sorted(memberships.items())
+        for market_date, market_date_text in market_dates
+        if any(
+            start <= market_date and (end is None or market_date < end)
+            for start, end in intervals
+        )
+        and (symbol, market_date_text) not in daily_keys
+    ]
+    if missing_membership_keys:
+        raise SnapshotValidationError(
+            "security_membership has missing explicit daily_bar/tradability "
+            "coverage for active symbol/date keys; "
+            f"missing={missing_membership_keys[:5]}"
+        )
+
     for symbol, trade_date_text in sorted(daily_keys):
         trade_date = date.fromisoformat(trade_date_text)
         intervals = memberships.get(symbol, [])
@@ -1077,6 +1120,36 @@ def _validate_cross_dataset_contract(
         if row["symbol"] not in memberships:
             raise SnapshotValidationError(
                 f"fundamental_pit symbol {row['symbol']} has no security membership"
+            )
+
+
+def _validate_signal_availability_dates(
+    rows_by_dataset: Mapping[str, Sequence[Mapping[str, str]]],
+    snapshot_timezone: ZoneInfo,
+) -> None:
+    daily_by_key = {
+        (row["symbol"], row["trade_date"]): row
+        for row in rows_by_dataset["daily_bar"]
+    }
+    tradability_by_key = {
+        (row["symbol"], row["trade_date"]): row
+        for row in rows_by_dataset["tradability"]
+    }
+    for key in sorted(daily_by_key):
+        daily_available_at = _parse_timestamp(
+            daily_by_key[key]["available_at"], "daily_bar.available_at"
+        )
+        tradability_available_at = _parse_timestamp(
+            tradability_by_key[key]["available_at"], "tradability.available_at"
+        )
+        signal_available_at = max(daily_available_at, tradability_available_at)
+        signal_local_date = signal_available_at.astimezone(snapshot_timezone).date()
+        trade_date = date.fromisoformat(key[1])
+        if signal_local_date != trade_date:
+            raise SnapshotValidationError(
+                f"daily_bar/tradability key {key} signal_available_at local date "
+                f"{signal_local_date.isoformat()} differs from trade_date "
+                f"{trade_date.isoformat()}"
             )
 
 
