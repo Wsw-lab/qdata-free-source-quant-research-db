@@ -159,6 +159,42 @@ class IngestDailyBundleTest(unittest.TestCase):
         self.assertEqual(completeness["expected_count"], 2)
         self.assertEqual(completeness["excluded_symbols"], {"listed_after_trade_date": ["300750.SZ"]})
 
+    def test_completeness_below_configured_threshold_blocks_strict_ingest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            loader = FakeLoader()
+            with self.assertRaisesRegex(QDataValidationError, "1 blocking issue"):
+                ingest_daily_bundle(
+                    "raw/samples/security_master.csv",
+                    "raw/samples/trading_calendar.csv",
+                    "raw/samples/daily_bar.csv",
+                    loader=loader,
+                    raw_root=directory,
+                    strict_quality=True,
+                    expected_symbols=["600519.SH", "000001.SZ", "300750.SZ"],
+                    min_completeness=1.0,
+                )
+
+            self.assertFalse(loader.quality_reports[0][0].passed)
+            self.assertEqual(loader.securities, [])
+            self.assertEqual(loader.daily_bars, [])
+
+    def test_completeness_threshold_remains_configurable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            loader = FakeLoader()
+            summary = ingest_daily_bundle(
+                "raw/samples/security_master.csv",
+                "raw/samples/trading_calendar.csv",
+                "raw/samples/daily_bar.csv",
+                loader=loader,
+                raw_root=directory,
+                strict_quality=True,
+                expected_symbols=["600519.SH", "000001.SZ", "300750.SZ"],
+                min_completeness=2 / 3,
+            )
+
+            self.assertTrue(summary.quality_report.passed)
+            self.assertEqual(len(loader.daily_bars), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

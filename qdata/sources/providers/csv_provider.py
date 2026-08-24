@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+from qdata.exceptions import QDataProviderError
 from qdata.ingest.csv_files import (
     read_adjustment_factors,
     read_daily_bars,
@@ -12,7 +13,7 @@ from qdata.ingest.csv_files import (
     read_suspensions,
     read_trading_calendar,
 )
-from qdata.ingest.models import AdjustmentFactorRecord, LimitPriceRecord, MinuteBarRecord, SuspensionRecord
+from qdata.ingest.models import AdjustmentFactorRecord, LimitPriceRecord, SuspensionRecord
 from qdata.sources.models import DailyMarketBundle, MarketConstraintBundle, MinuteMarketBundle
 
 
@@ -105,16 +106,15 @@ class CsvProvider:
         wanted = set(symbols or [])
         if symbols:
             securities = [record for record in securities if record.symbol in wanted]
-        if Path(self.minute_bar_path).exists():
-            minute_bars = read_minute_bars(self.minute_bar_path)
-            minute_bars = [record for record in minute_bars if record.trade_date == trade_date]
-            if symbols:
-                minute_bars = [record for record in minute_bars if record.symbol in wanted]
-        else:
-            daily_bars = read_daily_bars(self.daily_bar_path)
-            if symbols:
-                daily_bars = [record for record in daily_bars if record.symbol in wanted]
-            minute_bars = [_minute_from_daily(record) for record in daily_bars if record.trade_date == trade_date]
+        if not Path(self.minute_bar_path).exists():
+            raise QDataProviderError(
+                f"csv minute data is unavailable: {self.minute_bar_path}; "
+                "daily bars cannot be substituted for minute bars"
+            )
+        minute_bars = read_minute_bars(self.minute_bar_path)
+        minute_bars = [record for record in minute_bars if record.trade_date == trade_date]
+        if symbols:
+            minute_bars = [record for record in minute_bars if record.symbol in wanted]
         return MinuteMarketBundle(
             provider=self.provider_name,
             trade_date=trade_date,
@@ -204,21 +204,6 @@ def _filter_records(records, trade_date: str, wanted: set[str]):
     if wanted:
         filtered = [record for record in filtered if record.symbol in wanted]
     return filtered
-
-
-def _minute_from_daily(record) -> MinuteBarRecord:
-    return MinuteBarRecord(
-        symbol=record.symbol,
-        trade_date=record.trade_date,
-        bar_time=f"{record.trade_date} 09:31:00",
-        open=record.open,
-        high=record.high,
-        low=record.low,
-        close=record.close,
-        volume=record.volume,
-        amount=record.amount,
-        vwap=record.vwap,
-    )
 
 
 def _is_st(security) -> bool:

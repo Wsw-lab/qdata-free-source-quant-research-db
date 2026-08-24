@@ -197,7 +197,48 @@ class SqlDailyBundleLoader:
         trade_date = records[0].trade_date
         batch_id = self._create_batch("daily_bar", source_id, trade_date, len(records))
         ingest_time = datetime.now()
+        try:
+            self._write_daily_bar_metadata(records, security_map, source_id, batch_id)
+            rows = self._daily_bar_clickhouse_rows(records, security_map, source_id, batch_id, ingest_time)
+            self._clickhouse.insert(
+                "qts.daily_bar",
+                rows,
+                column_names=[
+                    "security_id",
+                    "trade_date",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "pre_close",
+                    "volume",
+                    "amount",
+                    "vwap",
+                    "turnover_rate",
+                    "limit_up",
+                    "limit_down",
+                    "is_suspended",
+                    "source_id",
+                    "batch_id",
+                    "data_version",
+                    "ingest_time",
+                    "quality_flag",
+                ],
+            )
+            self._postgres.commit()
+        except Exception as exc:
+            self._postgres.rollback()
+            self._finish_batches([batch_id], "failed", str(exc))
+            raise
+        self._finish_batches([batch_id], "success")
 
+    def _write_daily_bar_metadata(
+        self,
+        records: list[DailyBarRecord],
+        security_map: dict[str, int],
+        source_id: int,
+        batch_id: int,
+    ) -> None:
         with self._postgres.cursor() as cursor:
             for record in records:
                 security_id = security_map[record.symbol]
@@ -264,16 +305,21 @@ class SqlDailyBundleLoader:
                         """,
                         (security_id, record.trade_date, record.trade_date, source_id, batch_id),
                     )
-        self._postgres.commit()
 
+    @staticmethod
+    def _daily_bar_clickhouse_rows(
+        records: list[DailyBarRecord],
+        security_map: dict[str, int],
+        source_id: int,
+        batch_id: int,
+        ingest_time: datetime,
+    ) -> list[list[Any]]:
         rows = []
         for record in records:
-            security_id = security_map[record.symbol]
-            ch_trade_date = datetime.strptime(record.trade_date, "%Y-%m-%d").date()
             rows.append(
                 [
-                    security_id,
-                    ch_trade_date,
+                    security_map[record.symbol],
+                    datetime.strptime(record.trade_date, "%Y-%m-%d").date(),
                     record.open,
                     record.high,
                     record.low,
@@ -293,31 +339,7 @@ class SqlDailyBundleLoader:
                     "normal",
                 ]
             )
-        self._clickhouse.insert(
-            "qts.daily_bar",
-            rows,
-            column_names=[
-                "security_id",
-                "trade_date",
-                "open",
-                "high",
-                "low",
-                "close",
-                "pre_close",
-                "volume",
-                "amount",
-                "vwap",
-                "turnover_rate",
-                "limit_up",
-                "limit_down",
-                "is_suspended",
-                "source_id",
-                "batch_id",
-                "data_version",
-                "ingest_time",
-                "quality_flag",
-            ],
-        )
+        return rows
 
     def load_market_constraints(
         self,
@@ -421,6 +443,10 @@ class SqlDailyBundleLoader:
                     ),
                 )
         self._postgres.commit()
+        self._finish_batches(
+            [batch_id for batch_id in (factor_batch_id, limit_batch_id, suspension_batch_id) if batch_id],
+            "success",
+        )
 
     def load_minute_bars(self, records: list[MinuteBarRecord]) -> None:
         self.open()
@@ -452,27 +478,32 @@ class SqlDailyBundleLoader:
                     "normal",
                 ]
             )
-        self._clickhouse.insert(
-            "qts.minute_bar",
-            rows,
-            column_names=[
-                "security_id",
-                "trade_date",
-                "bar_time",
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume",
-                "amount",
-                "vwap",
-                "source_id",
-                "batch_id",
-                "data_version",
-                "ingest_time",
-                "quality_flag",
-            ],
-        )
+        try:
+            self._clickhouse.insert(
+                "qts.minute_bar",
+                rows,
+                column_names=[
+                    "security_id",
+                    "trade_date",
+                    "bar_time",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "amount",
+                    "vwap",
+                    "source_id",
+                    "batch_id",
+                    "data_version",
+                    "ingest_time",
+                    "quality_flag",
+                ],
+            )
+        except Exception as exc:
+            self._finish_batches([batch_id], "failed", str(exc))
+            raise
+        self._finish_batches([batch_id], "success")
 
     def load_tradable_universe(
         self,
@@ -527,6 +558,7 @@ class SqlDailyBundleLoader:
                     ),
                 )
         self._postgres.commit()
+        self._finish_batches([batch_id], "success")
 
     def write_quality_report(
         self,
@@ -595,6 +627,7 @@ class SqlDailyBundleLoader:
                     ),
                 )
         self._postgres.commit()
+        self._finish_batches([batch_id], "success")
 
     def ensure_metadata(self) -> None:
         source_id = None
@@ -666,7 +699,7 @@ class SqlDailyBundleLoader:
                 INSERT INTO qmeta.data_batch (
                     dataset_id, source_id, batch_code, trade_date, natural_date,
                     started_at, finished_at, status, raw_uri, row_count
-                ) VALUES (%s, %s, %s, %s, CURRENT_DATE, now(), now(), 'success', %s, %s)
+                ) VALUES (%s, %s, %s, %s, CURRENT_DATE, now(), NULL, 'running', %s, %s)
                 RETURNING batch_id
                 """,
                 (dataset_id, source_id, batch_code, trade_date, f"raw://{self.source_code}", row_count),
@@ -674,6 +707,32 @@ class SqlDailyBundleLoader:
             batch_id = cursor.fetchone()["batch_id"]
         self._postgres.commit()
         return batch_id
+
+    def _finish_batches(
+        self,
+        batch_ids: list[int],
+        status: str,
+        error_message: str | None = None,
+    ) -> None:
+        if not batch_ids:
+            return
+        if status not in {"success", "failed"}:
+            raise QDataValidationError("batch terminal status must be success or failed")
+        error_count = 1 if status == "failed" else 0
+        with self._postgres.cursor() as cursor:
+            for batch_id in batch_ids:
+                cursor.execute(
+                    """
+                    UPDATE qmeta.data_batch
+                    SET status = %s,
+                        finished_at = now(),
+                        error_count = %s,
+                        error_message = %s
+                    WHERE batch_id = %s
+                    """,
+                    (status, error_count, error_message, batch_id),
+                )
+        self._postgres.commit()
 
     def _security_id_map(self, symbols: list[str]) -> dict[str, int]:
         unique_symbols = sorted(set(symbols))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from qdata.backend_utils import (
@@ -178,39 +179,74 @@ class SqlBackend:
         validate_enum(adjust, {"none", "forward", "backward"}, "adjust")
         validate_enum(query_mode, {"latest", "asof", "vintage"}, "query_mode")
 
+        if query_mode == "asof" and not asof_time:
+            raise QDataValidationError("asof_time is required when query_mode='asof'")
+        if query_mode == "vintage" and not data_version:
+            raise QDataValidationError("data_version is required when query_mode='vintage'")
+        if asof_time:
+            self._validate_asof_time(asof_time)
+
         security_map = self._resolve_security_map(symbols, security_ids, universe, asof_date=end_date)
         requested_fields = fields or ["open", "high", "low", "close", "volume", "amount"]
         allowed_fields = self.PRICE_FIELDS if frequency == "1d" else self.MINUTE_FIELDS
         self._validate_fields(requested_fields, allowed_fields, "fields")
 
         table = "qts.daily_bar" if frequency == "1d" else "qts.minute_bar"
+        dataset_code = "daily_bar" if frequency == "1d" else "minute_bar"
+        resolved_version = self._resolve_dataset_version(dataset_code, data_version) if data_version else None
         base_fields = ["security_id", "trade_date"]
         if frequency == "1m":
             base_fields.append("bar_time")
         select_fields = base_fields + requested_fields
         order_fields = "security_id, trade_date" + (", bar_time" if frequency == "1m" else "")
+        where = [
+            "security_id IN %(security_ids)s",
+            "trade_date BETWEEN %(start_date)s AND %(end_date)s",
+        ]
+        params: dict[str, Any] = {
+            "security_ids": tuple(security_map),
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+        if asof_time:
+            where.append("ingest_time <= %(asof_time)s")
+            params["asof_time"] = asof_time
+        if resolved_version:
+            where.append("data_version = %(resolved_data_version)s")
+            params["resolved_data_version"] = resolved_version["data_version"]
         rows = self.clickhouse.fetch_all(
             f"""
             SELECT {", ".join(select_fields)}
-            FROM {table} FINAL
-            WHERE security_id IN %(security_ids)s
-              AND trade_date BETWEEN %(start_date)s AND %(end_date)s
+            FROM (
+                SELECT
+                    {", ".join(select_fields)},
+                    row_number() OVER (
+                        PARTITION BY {order_fields}
+                        ORDER BY ingest_time DESC, data_version DESC
+                    ) AS _qdata_revision_rank
+                FROM {table}
+                {self._where(where)}
+            )
+            WHERE _qdata_revision_rank = 1
             ORDER BY {order_fields}
             """,
-            {
-                "security_ids": tuple(security_map),
-                "start_date": start_date,
-                "end_date": end_date,
-            },
+            params,
         )
         normalized = normalize_rows(rows)
         if adjust != "none" and frequency == "1d":
-            factors = self._get_adjustment_factor_map(list(security_map), start_date, end_date)
+            factors = self._get_adjustment_factor_map(
+                list(security_map),
+                start_date,
+                end_date,
+                asof_time=asof_time,
+                batch_id=resolved_version.get("batch_id") if resolved_version else None,
+            )
             normalized = [self._apply_adjustment(row, adjust, factors) for row in normalized]
         for row in normalized:
             row["symbol"] = security_map.get(row["security_id"])
         projected = project(normalized, ["symbol"] + select_fields)
-        return response(projected, [f"{frequency}_bar:sql"], query_mode, asof_time, data_version)
+        resolved_version_code = resolved_version["version_code"] if resolved_version else None
+        return response(projected, [f"{frequency}_bar:sql"], query_mode, asof_time, resolved_version_code)
 
     def get_adjustment_factor(
         self,
@@ -667,12 +703,14 @@ class SqlBackend:
                 quality_flag
             FROM qts.factor_value_daily FINAL
             WHERE factor_id IN %(factor_ids)s
+              AND factor_version_id IN %(factor_version_ids)s
               AND security_id IN %(security_ids)s
               AND trade_date BETWEEN %(start_date)s AND %(end_date)s
             ORDER BY trade_date, security_id, factor_id
             """,
             {
                 "factor_ids": tuple(factor_map),
+                "factor_version_ids": tuple(factor["factor_version_id"] for factor in factor_map.values()),
                 "security_ids": tuple(security_map),
                 "start_date": start_date,
                 "end_date": end_date,
@@ -680,10 +718,14 @@ class SqlBackend:
         )
         normalized = normalize_rows(rows)
         factor_code_by_id = {factor_id: factor["factor_code"] for factor_id, factor in factor_map.items()}
+        version_code_by_id = {
+            factor["factor_version_id"]: factor["version_code"]
+            for factor in factor_map.values()
+        }
         for row in normalized:
             row["symbol"] = security_map.get(row["security_id"])
             row["factor_code"] = factor_code_by_id.get(row["factor_id"])
-            row["factor_version"] = factor_version
+            row["factor_version"] = version_code_by_id.get(row["factor_version_id"])
         if format == "wide":
             normalized = self._factor_rows_to_wide(normalized, factors)
         else:
@@ -784,28 +826,88 @@ class SqlBackend:
             """,
             {"factors": factors, "factor_version": factor_version},
         )
-        result = {row["factor_id"]: normalize_rows([row])[0] for row in rows}
-        if not result:
-            raise QDataNotFoundError("No factors matched the request")
-        return result
+        normalized = normalize_rows(rows)
+        rows_by_code: dict[str, list[dict[str, Any]]] = {}
+        for row in normalized:
+            rows_by_code.setdefault(row["factor_code"], []).append(row)
+        missing = sorted(set(factors) - set(rows_by_code))
+        if missing:
+            raise QDataNotFoundError(f"No factor version matched: {missing}")
+        ambiguous = sorted(code for code, matches in rows_by_code.items() if len(matches) != 1)
+        if ambiguous:
+            raise QDataValidationError(f"Factor version selection is ambiguous: {ambiguous}")
+        return {matches[0]["factor_id"]: matches[0] for matches in rows_by_code.values()}
+
+    def _resolve_dataset_version(self, dataset_code: str, requested_version: str) -> dict[str, Any]:
+        rows = normalize_rows(
+            self.postgres.fetch_all(
+                """
+                SELECT
+                    dv.data_version,
+                    dv.version_code,
+                    dv.batch_id,
+                    dv.status
+                FROM qmeta.dataset_version dv
+                JOIN qmeta.dataset_catalog dc ON dc.dataset_id = dv.dataset_id
+                WHERE dc.dataset_code = %(dataset_code)s
+                  AND (dv.version_code = %(data_version)s OR CAST(dv.data_version AS TEXT) = %(data_version)s)
+                  AND dv.status IN ('active', 'superseded')
+                """,
+                {"dataset_code": dataset_code, "data_version": str(requested_version)},
+            )
+        )
+        if not rows:
+            raise QDataNotFoundError(
+                f"Unknown or unavailable data_version for {dataset_code}: {requested_version}"
+            )
+        if len(rows) != 1:
+            raise QDataValidationError(
+                f"data_version selection is ambiguous for {dataset_code}: {requested_version}"
+            )
+        return rows[0]
 
     def _get_adjustment_factor_map(
         self,
         security_ids: list[int],
         start_date: str,
         end_date: str,
+        asof_time: str | None = None,
+        batch_id: int | None = None,
     ) -> dict[tuple[int, str], dict[str, Any]]:
+        where = [
+            "security_id = ANY(%(security_ids)s)",
+            "trade_date BETWEEN %(start_date)s AND %(end_date)s",
+        ]
+        params: dict[str, Any] = {
+            "security_ids": security_ids,
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+        if asof_time:
+            where.append("ingest_time <= %(asof_time)s")
+            params["asof_time"] = asof_time
+        if batch_id is not None:
+            where.append("batch_id = %(batch_id)s")
+            params["batch_id"] = batch_id
         rows = self.postgres.fetch_all(
-            """
-            SELECT security_id, trade_date, factor_forward, factor_backward
+            f"""
+            SELECT DISTINCT ON (security_id, trade_date)
+                security_id, trade_date, factor_forward, factor_backward
             FROM qmeta.adjustment_factor
-            WHERE security_id = ANY(%(security_ids)s)
-              AND trade_date BETWEEN %(start_date)s AND %(end_date)s
+            {self._where(where)}
+            ORDER BY security_id, trade_date, revision_id DESC, ingest_time DESC
             """,
-            {"security_ids": security_ids, "start_date": start_date, "end_date": end_date},
+            params,
         )
         normalized = normalize_rows(rows)
         return {(row["security_id"], row["trade_date"]): row for row in normalized}
+
+    @staticmethod
+    def _validate_asof_time(value: str) -> None:
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise QDataValidationError("asof_time must use ISO-8601 date/time format") from exc
 
     def _apply_adjustment(
         self,
