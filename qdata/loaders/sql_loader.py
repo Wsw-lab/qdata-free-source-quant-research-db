@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -15,6 +16,13 @@ from qdata.ingest.models import (
     SuspensionRecord,
     TradableUniverseRecord,
 )
+
+
+@dataclass(frozen=True)
+class VersionedBatch:
+    batch_id: int
+    data_version: int
+    version_code: str
 
 
 class SqlDailyBundleLoader:
@@ -195,11 +203,22 @@ class SqlDailyBundleLoader:
         source_id = self._source_id()
         security_map = self._security_id_map([record.symbol for record in records])
         trade_date = records[0].trade_date
-        batch_id = self._create_batch("daily_bar", source_id, trade_date, len(records))
+        versioned_batch = self._create_versioned_batch(
+            "daily_bar", source_id, trade_date, len(records)
+        )
         ingest_time = datetime.now()
         try:
-            self._write_daily_bar_metadata(records, security_map, source_id, batch_id)
-            rows = self._daily_bar_clickhouse_rows(records, security_map, source_id, batch_id, ingest_time)
+            self._write_daily_bar_metadata(
+                records, security_map, source_id, versioned_batch.batch_id
+            )
+            rows = self._daily_bar_clickhouse_rows(
+                records,
+                security_map,
+                source_id,
+                versioned_batch.batch_id,
+                versioned_batch.data_version,
+                ingest_time,
+            )
             self._clickhouse.insert(
                 "qts.daily_bar",
                 rows,
@@ -225,12 +244,10 @@ class SqlDailyBundleLoader:
                     "quality_flag",
                 ],
             )
-            self._postgres.commit()
+            self._finish_versioned_batch(versioned_batch, "success")
         except Exception as exc:
-            self._postgres.rollback()
-            self._finish_batches([batch_id], "failed", str(exc))
+            self._record_lifecycle_failure(exc, versioned_batch=versioned_batch)
             raise
-        self._finish_batches([batch_id], "success")
 
     def _write_daily_bar_metadata(
         self,
@@ -242,31 +259,15 @@ class SqlDailyBundleLoader:
         with self._postgres.cursor() as cursor:
             for record in records:
                 security_id = security_map[record.symbol]
-                cursor.execute(
-                    """
-                    INSERT INTO qmeta.adjustment_factor (
-                        security_id, trade_date, factor_forward, factor_backward, ex_right_type,
-                        announce_time, effective_time, source_id, batch_id, revision_id
-                    ) VALUES (%s, %s, %s, %s, %s, now(), now(), %s, %s, 1)
-                    ON CONFLICT (security_id, trade_date, revision_id) DO UPDATE SET
-                        factor_forward = EXCLUDED.factor_forward,
-                        factor_backward = EXCLUDED.factor_backward,
-                        ex_right_type = EXCLUDED.ex_right_type,
-                        announce_time = EXCLUDED.announce_time,
-                        effective_time = EXCLUDED.effective_time,
-                        ingest_time = now(),
-                        source_id = EXCLUDED.source_id,
-                        batch_id = EXCLUDED.batch_id
-                    """,
-                    (
-                        security_id,
-                        record.trade_date,
-                        record.factor_forward,
-                        record.factor_backward,
-                        record.ex_right_type,
-                        source_id,
-                        batch_id,
-                    ),
+                self._append_adjustment_factor(
+                    cursor,
+                    security_id=security_id,
+                    trade_date=record.trade_date,
+                    factor_forward=record.factor_forward,
+                    factor_backward=record.factor_backward,
+                    ex_right_type=record.ex_right_type,
+                    source_id=source_id,
+                    batch_id=batch_id,
                 )
                 cursor.execute(
                     """
@@ -312,6 +313,7 @@ class SqlDailyBundleLoader:
         security_map: dict[str, int],
         source_id: int,
         batch_id: int,
+        data_version: int,
         ingest_time: datetime,
     ) -> list[list[Any]]:
         rows = []
@@ -334,7 +336,7 @@ class SqlDailyBundleLoader:
                     1 if record.is_suspended else 0,
                     source_id,
                     batch_id,
-                    batch_id,
+                    data_version,
                     ingest_time,
                     "normal",
                 ]
@@ -355,98 +357,107 @@ class SqlDailyBundleLoader:
             return
         source_id = self._source_id()
         security_map = self._security_id_map(symbols)
-        factor_batch_id = self._create_batch("adjustment_factor", source_id, _first_trade_date(adjustment_factors), len(adjustment_factors)) if adjustment_factors else None
-        limit_batch_id = self._create_batch("limit_price_daily", source_id, _first_trade_date(limit_prices), len(limit_prices)) if limit_prices else None
-        suspension_batch_id = self._create_batch("suspension_history", source_id, _first_suspension_date(suspensions), len(suspensions)) if suspensions else None
-        with self._postgres.cursor() as cursor:
-            for record in adjustment_factors:
-                cursor.execute(
-                    """
-                    INSERT INTO qmeta.adjustment_factor (
-                        security_id, trade_date, factor_forward, factor_backward, ex_right_type,
-                        announce_time, effective_time, source_id, batch_id, revision_id
-                    ) VALUES (%s, %s, %s, %s, %s, now(), %s::date + TIME '00:00', %s, %s, 1)
-                    ON CONFLICT (security_id, trade_date, revision_id) DO UPDATE SET
-                        factor_forward = EXCLUDED.factor_forward,
-                        factor_backward = EXCLUDED.factor_backward,
-                        ex_right_type = EXCLUDED.ex_right_type,
-                        announce_time = EXCLUDED.announce_time,
-                        effective_time = EXCLUDED.effective_time,
-                        ingest_time = now(),
-                        source_id = EXCLUDED.source_id,
-                        batch_id = EXCLUDED.batch_id
-                    """,
-                    (
-                        security_map[record.symbol],
-                        record.trade_date,
-                        record.factor_forward,
-                        record.factor_backward,
-                        record.ex_right_type,
-                        record.trade_date,
-                        source_id,
-                        factor_batch_id,
-                    ),
+        factor_batch_id = None
+        limit_batch_id = None
+        suspension_batch_id = None
+        batch_ids: list[int] = []
+        try:
+            if adjustment_factors:
+                factor_batch_id = self._create_batch(
+                    "adjustment_factor",
+                    source_id,
+                    _first_trade_date(adjustment_factors),
+                    len(adjustment_factors),
                 )
-            for record in limit_prices:
-                cursor.execute(
-                    """
-                    INSERT INTO qmeta.limit_price_daily (
-                        security_id, trade_date, limit_up, limit_down, limit_rule, is_st,
-                        is_new_listing, source_id, batch_id, revision_id
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1)
-                    ON CONFLICT (security_id, trade_date, revision_id) DO UPDATE SET
-                        limit_up = EXCLUDED.limit_up,
-                        limit_down = EXCLUDED.limit_down,
-                        limit_rule = EXCLUDED.limit_rule,
-                        is_st = EXCLUDED.is_st,
-                        is_new_listing = EXCLUDED.is_new_listing,
-                        ingest_time = now(),
-                        source_id = EXCLUDED.source_id,
-                        batch_id = EXCLUDED.batch_id
-                    """,
-                    (
-                        security_map[record.symbol],
-                        record.trade_date,
-                        record.limit_up,
-                        record.limit_down,
-                        record.limit_rule,
-                        record.is_st,
-                        record.is_new_listing,
-                        source_id,
-                        limit_batch_id,
-                    ),
+                batch_ids.append(factor_batch_id)
+            if limit_prices:
+                limit_batch_id = self._create_batch(
+                    "limit_price_daily",
+                    source_id,
+                    _first_trade_date(limit_prices),
+                    len(limit_prices),
                 )
-            for record in suspensions:
-                cursor.execute(
-                    """
-                    INSERT INTO qmeta.suspension_history (
-                        security_id, start_time, end_time, suspension_type, reason,
-                        announce_time, source_id, batch_id, revision_id
-                    ) VALUES (%s, %s, %s, %s, %s, now(), %s, %s, 1)
-                    ON CONFLICT (security_id, start_time, revision_id) DO UPDATE SET
-                        end_time = EXCLUDED.end_time,
-                        suspension_type = EXCLUDED.suspension_type,
-                        reason = EXCLUDED.reason,
-                        announce_time = EXCLUDED.announce_time,
-                        ingest_time = now(),
-                        source_id = EXCLUDED.source_id,
-                        batch_id = EXCLUDED.batch_id
-                    """,
-                    (
-                        security_map[record.symbol],
-                        record.start_time,
-                        record.end_time,
-                        record.suspension_type,
-                        record.reason,
-                        source_id,
-                        suspension_batch_id,
-                    ),
+                batch_ids.append(limit_batch_id)
+            if suspensions:
+                suspension_batch_id = self._create_batch(
+                    "suspension_history",
+                    source_id,
+                    _first_suspension_date(suspensions),
+                    len(suspensions),
                 )
-        self._postgres.commit()
-        self._finish_batches(
-            [batch_id for batch_id in (factor_batch_id, limit_batch_id, suspension_batch_id) if batch_id],
-            "success",
-        )
+                batch_ids.append(suspension_batch_id)
+
+            with self._postgres.cursor() as cursor:
+                for record in adjustment_factors:
+                    self._append_adjustment_factor(
+                        cursor,
+                        security_id=security_map[record.symbol],
+                        trade_date=record.trade_date,
+                        factor_forward=record.factor_forward,
+                        factor_backward=record.factor_backward,
+                        ex_right_type=record.ex_right_type,
+                        source_id=source_id,
+                        batch_id=factor_batch_id,
+                    )
+                for record in limit_prices:
+                    cursor.execute(
+                        """
+                        INSERT INTO qmeta.limit_price_daily (
+                            security_id, trade_date, limit_up, limit_down, limit_rule, is_st,
+                            is_new_listing, source_id, batch_id, revision_id
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1)
+                        ON CONFLICT (security_id, trade_date, revision_id) DO UPDATE SET
+                            limit_up = EXCLUDED.limit_up,
+                            limit_down = EXCLUDED.limit_down,
+                            limit_rule = EXCLUDED.limit_rule,
+                            is_st = EXCLUDED.is_st,
+                            is_new_listing = EXCLUDED.is_new_listing,
+                            ingest_time = now(),
+                            source_id = EXCLUDED.source_id,
+                            batch_id = EXCLUDED.batch_id
+                        """,
+                        (
+                            security_map[record.symbol],
+                            record.trade_date,
+                            record.limit_up,
+                            record.limit_down,
+                            record.limit_rule,
+                            record.is_st,
+                            record.is_new_listing,
+                            source_id,
+                            limit_batch_id,
+                        ),
+                    )
+                for record in suspensions:
+                    cursor.execute(
+                        """
+                        INSERT INTO qmeta.suspension_history (
+                            security_id, start_time, end_time, suspension_type, reason,
+                            announce_time, source_id, batch_id, revision_id
+                        ) VALUES (%s, %s, %s, %s, %s, now(), %s, %s, 1)
+                        ON CONFLICT (security_id, start_time, revision_id) DO UPDATE SET
+                            end_time = EXCLUDED.end_time,
+                            suspension_type = EXCLUDED.suspension_type,
+                            reason = EXCLUDED.reason,
+                            announce_time = EXCLUDED.announce_time,
+                            ingest_time = now(),
+                            source_id = EXCLUDED.source_id,
+                            batch_id = EXCLUDED.batch_id
+                        """,
+                        (
+                            security_map[record.symbol],
+                            record.start_time,
+                            record.end_time,
+                            record.suspension_type,
+                            record.reason,
+                            source_id,
+                            suspension_batch_id,
+                        ),
+                    )
+            self._finish_batches(batch_ids, "success")
+        except Exception as exc:
+            self._record_lifecycle_failure(exc, batch_ids=batch_ids)
+            raise
 
     def load_minute_bars(self, records: list[MinuteBarRecord]) -> None:
         self.open()
@@ -455,7 +466,9 @@ class SqlDailyBundleLoader:
         source_id = self._source_id()
         security_map = self._security_id_map([record.symbol for record in records])
         trade_date = records[0].trade_date
-        batch_id = self._create_batch("minute_bar", source_id, trade_date, len(records))
+        versioned_batch = self._create_versioned_batch(
+            "minute_bar", source_id, trade_date, len(records)
+        )
         ingest_time = datetime.now()
         rows = []
         for record in records:
@@ -472,8 +485,8 @@ class SqlDailyBundleLoader:
                     record.amount,
                     record.vwap,
                     source_id,
-                    batch_id,
-                    batch_id,
+                    versioned_batch.batch_id,
+                    versioned_batch.data_version,
                     ingest_time,
                     "normal",
                 ]
@@ -500,10 +513,10 @@ class SqlDailyBundleLoader:
                     "quality_flag",
                 ],
             )
+            self._finish_versioned_batch(versioned_batch, "success")
         except Exception as exc:
-            self._finish_batches([batch_id], "failed", str(exc))
+            self._record_lifecycle_failure(exc, versioned_batch=versioned_batch)
             raise
-        self._finish_batches([batch_id], "success")
 
     def load_tradable_universe(
         self,
@@ -514,51 +527,54 @@ class SqlDailyBundleLoader:
     ) -> None:
         self.open()
         source_id = self._source_id()
-        batch_id = self._create_batch("tradable_universe", source_id, trade_date, len(records))
         security_map = self._security_id_map([record.symbol for record in records]) if records else {}
-        with self._postgres.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO qmeta.universe_definition (
-                    universe_code, universe_name, universe_type, description, owner
-                ) VALUES (%s, %s, 'rule_based', 'generated tradable universe', 'qdata')
-                ON CONFLICT (universe_code) DO UPDATE SET
-                    universe_name = EXCLUDED.universe_name,
-                    universe_type = EXCLUDED.universe_type,
-                    description = EXCLUDED.description,
-                    owner = EXCLUDED.owner,
-                    updated_at = now()
-                RETURNING universe_id
-                """,
-                (universe_code, universe_name),
-            )
-            universe_id = cursor.fetchone()["universe_id"]
-            for record in records:
+        batch_id = self._create_batch("tradable_universe", source_id, trade_date, len(records))
+        try:
+            with self._postgres.cursor() as cursor:
                 cursor.execute(
                     """
-                    INSERT INTO qpit.universe_member_pit (
-                        universe_id, security_id, effective_date, end_date, weight,
-                        announce_time, source_id, batch_id, revision_id
-                    ) VALUES (%s, %s, %s, NULL, %s, now(), %s, %s, 1)
-                    ON CONFLICT (universe_id, security_id, effective_date, revision_id) DO UPDATE SET
-                        end_date = EXCLUDED.end_date,
-                        weight = EXCLUDED.weight,
-                        announce_time = EXCLUDED.announce_time,
-                        ingest_time = now(),
-                        source_id = EXCLUDED.source_id,
-                        batch_id = EXCLUDED.batch_id
+                    INSERT INTO qmeta.universe_definition (
+                        universe_code, universe_name, universe_type, description, owner
+                    ) VALUES (%s, %s, 'rule_based', 'generated tradable universe', 'qdata')
+                    ON CONFLICT (universe_code) DO UPDATE SET
+                        universe_name = EXCLUDED.universe_name,
+                        universe_type = EXCLUDED.universe_type,
+                        description = EXCLUDED.description,
+                        owner = EXCLUDED.owner,
+                        updated_at = now()
+                    RETURNING universe_id
                     """,
-                    (
-                        universe_id,
-                        security_map[record.symbol],
-                        trade_date,
-                        record.weight,
-                        source_id,
-                        batch_id,
-                    ),
+                    (universe_code, universe_name),
                 )
-        self._postgres.commit()
-        self._finish_batches([batch_id], "success")
+                universe_id = cursor.fetchone()["universe_id"]
+                for record in records:
+                    cursor.execute(
+                        """
+                        INSERT INTO qpit.universe_member_pit (
+                            universe_id, security_id, effective_date, end_date, weight,
+                            announce_time, source_id, batch_id, revision_id
+                        ) VALUES (%s, %s, %s, NULL, %s, now(), %s, %s, 1)
+                        ON CONFLICT (universe_id, security_id, effective_date, revision_id) DO UPDATE SET
+                            end_date = EXCLUDED.end_date,
+                            weight = EXCLUDED.weight,
+                            announce_time = EXCLUDED.announce_time,
+                            ingest_time = now(),
+                            source_id = EXCLUDED.source_id,
+                            batch_id = EXCLUDED.batch_id
+                        """,
+                        (
+                            universe_id,
+                            security_map[record.symbol],
+                            trade_date,
+                            record.weight,
+                            source_id,
+                            batch_id,
+                        ),
+                    )
+            self._finish_batches([batch_id], "success")
+        except Exception as exc:
+            self._record_lifecycle_failure(exc, batch_ids=[batch_id])
+            raise
 
     def write_quality_report(
         self,
@@ -568,66 +584,69 @@ class SqlDailyBundleLoader:
     ) -> None:
         self.open()
         source_id = self._source_id()
-        batch_id = self._create_batch("data_quality", source_id, check_date, len(report.issues))
         context = self._quality_context(context)
         job_code = context.get("job_code")
-        with self._postgres.cursor() as cursor:
-            if check_date:
-                cursor.execute(
-                    """
-                    DELETE FROM qmeta.data_quality_check_result
-                    WHERE check_date = %s
-                      AND check_type IN ('bundle', 'ingest_quality')
-                      AND dataset_id IN (
-                          SELECT dataset_id
-                          FROM qmeta.dataset_catalog
-                          WHERE dataset_code = ANY(%s)
-                      )
-                      AND batch_id IN (
-                          SELECT batch_id
-                          FROM qmeta.data_batch
-                          WHERE source_id = %s
-                      )
-                      AND (
-                          (%s::text IS NULL AND NOT (details ? 'job_code'))
-                          OR (%s::text IS NOT NULL AND details->>'job_code' = %s)
-                      )
-                    """,
-                    (check_date, list(self.DATASETS), source_id, job_code, job_code, job_code),
-                )
-            if not report.issues:
-                dataset_id = self._dataset_id("daily_bar")
-                cursor.execute(
-                    """
-                    INSERT INTO qmeta.data_quality_check_result (
-                        dataset_id, batch_id, check_date, check_name, check_type, status, severity,
-                        metric_value, threshold_value, affected_rows, details
-                    ) VALUES (%s, %s, %s, 'daily_bundle_quality', 'bundle', 'pass', 'info', 1, 1, 0, %s::jsonb)
-                    """,
-                    (dataset_id, batch_id, check_date, self._json_details(context)),
-                )
-            for issue in report.issues:
-                dataset_id = self._dataset_id(issue.dataset_code)
-                status = "failed" if issue.severity in {"high", "critical"} else "warning"
-                cursor.execute(
-                    """
-                    INSERT INTO qmeta.data_quality_check_result (
-                        dataset_id, batch_id, check_date, check_name, check_type, status, severity,
-                        metric_value, threshold_value, affected_rows, details
-                    ) VALUES (%s, %s, %s, %s, 'ingest_quality', %s, %s, NULL, NULL, 1, %s::jsonb)
-                    """,
-                    (
-                        dataset_id,
-                        batch_id,
-                        check_date or issue.trade_date,
-                        issue.check_name,
-                        status,
-                        issue.severity,
-                        self._issue_details(issue, context),
-                    ),
-                )
-        self._postgres.commit()
-        self._finish_batches([batch_id], "success")
+        batch_id = self._create_batch("data_quality", source_id, check_date, len(report.issues))
+        try:
+            with self._postgres.cursor() as cursor:
+                if check_date:
+                    cursor.execute(
+                        """
+                        DELETE FROM qmeta.data_quality_check_result
+                        WHERE check_date = %s
+                          AND check_type IN ('bundle', 'ingest_quality')
+                          AND dataset_id IN (
+                              SELECT dataset_id
+                              FROM qmeta.dataset_catalog
+                              WHERE dataset_code = ANY(%s)
+                          )
+                          AND batch_id IN (
+                              SELECT batch_id
+                              FROM qmeta.data_batch
+                              WHERE source_id = %s
+                          )
+                          AND (
+                              (%s::text IS NULL AND NOT (details ? 'job_code'))
+                              OR (%s::text IS NOT NULL AND details->>'job_code' = %s)
+                          )
+                        """,
+                        (check_date, list(self.DATASETS), source_id, job_code, job_code, job_code),
+                    )
+                if not report.issues:
+                    dataset_id = self._dataset_id("daily_bar")
+                    cursor.execute(
+                        """
+                        INSERT INTO qmeta.data_quality_check_result (
+                            dataset_id, batch_id, check_date, check_name, check_type, status, severity,
+                            metric_value, threshold_value, affected_rows, details
+                        ) VALUES (%s, %s, %s, 'daily_bundle_quality', 'bundle', 'pass', 'info', 1, 1, 0, %s::jsonb)
+                        """,
+                        (dataset_id, batch_id, check_date, self._json_details(context)),
+                    )
+                for issue in report.issues:
+                    dataset_id = self._dataset_id(issue.dataset_code)
+                    status = "failed" if issue.severity in {"high", "critical"} else "warning"
+                    cursor.execute(
+                        """
+                        INSERT INTO qmeta.data_quality_check_result (
+                            dataset_id, batch_id, check_date, check_name, check_type, status, severity,
+                            metric_value, threshold_value, affected_rows, details
+                        ) VALUES (%s, %s, %s, %s, 'ingest_quality', %s, %s, NULL, NULL, 1, %s::jsonb)
+                        """,
+                        (
+                            dataset_id,
+                            batch_id,
+                            check_date or issue.trade_date,
+                            issue.check_name,
+                            status,
+                            issue.severity,
+                            self._issue_details(issue, context),
+                        ),
+                    )
+            self._finish_batches([batch_id], "success")
+        except Exception as exc:
+            self._record_lifecycle_failure(exc, batch_ids=[batch_id])
+            raise
 
     def ensure_metadata(self) -> None:
         source_id = None
@@ -690,23 +709,163 @@ class SqlDailyBundleLoader:
             raise QDataValidationError(f"dataset not found: {dataset_code}")
         return row["dataset_id"]
 
-    def _create_batch(self, dataset_code: str, source_id: int, trade_date: str | None, row_count: int) -> int:
+    @staticmethod
+    def _append_adjustment_factor(
+        cursor: Any,
+        security_id: int,
+        trade_date: str,
+        factor_forward: float | None,
+        factor_backward: float | None,
+        ex_right_type: str,
+        source_id: int,
+        batch_id: int,
+    ) -> None:
+        revision_lock_key = f"qmeta.adjustment_factor:{security_id}:{trade_date}"
+        cursor.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (revision_lock_key,),
+        )
+        cursor.execute(
+            """
+            SELECT COALESCE(MAX(revision_id), 0) + 1 AS revision_id
+            FROM qmeta.adjustment_factor
+            WHERE security_id = %s AND trade_date = %s
+            """,
+            (security_id, trade_date),
+        )
+        revision_row = cursor.fetchone()
+        if not revision_row or revision_row.get("revision_id") is None:
+            raise QDataValidationError("could not allocate adjustment-factor revision")
+        cursor.execute(
+            """
+            INSERT INTO qmeta.adjustment_factor (
+                security_id, trade_date, factor_forward, factor_backward, ex_right_type,
+                announce_time, effective_time, source_id, batch_id, revision_id
+            ) VALUES (%s, %s, %s, %s, %s, now(), %s::date + TIME '00:00', %s, %s, %s)
+            """,
+            (
+                security_id,
+                trade_date,
+                factor_forward,
+                factor_backward,
+                ex_right_type,
+                trade_date,
+                source_id,
+                batch_id,
+                revision_row["revision_id"],
+            ),
+        )
+
+    def _create_batch(
+        self,
+        dataset_code: str,
+        source_id: int,
+        trade_date: str | None,
+        row_count: int,
+    ) -> int:
         dataset_id = self._dataset_id(dataset_code)
-        batch_code = f"{self.source_code}-{dataset_code}-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
-        with self._postgres.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO qmeta.data_batch (
-                    dataset_id, source_id, batch_code, trade_date, natural_date,
-                    started_at, finished_at, status, raw_uri, row_count
-                ) VALUES (%s, %s, %s, %s, CURRENT_DATE, now(), NULL, 'running', %s, %s)
-                RETURNING batch_id
-                """,
-                (dataset_id, source_id, batch_code, trade_date, f"raw://{self.source_code}", row_count),
-            )
-            batch_id = cursor.fetchone()["batch_id"]
-        self._postgres.commit()
+        batch_code = self._new_batch_code(dataset_code)
+        try:
+            with self._postgres.cursor() as cursor:
+                batch_id = self._insert_running_batch(
+                    cursor,
+                    dataset_id,
+                    source_id,
+                    batch_code,
+                    trade_date,
+                    row_count,
+                )
+            self._postgres.commit()
+        except Exception as exc:
+            self._rollback_preserving(exc)
+            raise
         return batch_id
+
+    def _create_versioned_batch(
+        self,
+        dataset_code: str,
+        source_id: int,
+        trade_date: str | None,
+        row_count: int,
+    ) -> VersionedBatch:
+        dataset_id = self._dataset_id(dataset_code)
+        batch_code = self._new_batch_code(dataset_code)
+        version_code = f"{dataset_code}:{batch_code}"
+        try:
+            with self._postgres.cursor() as cursor:
+                batch_id = self._insert_running_batch(
+                    cursor,
+                    dataset_id,
+                    source_id,
+                    batch_code,
+                    trade_date,
+                    row_count,
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO qmeta.dataset_version (
+                        dataset_id, version_code, batch_id, valid_from, status, description
+                    ) VALUES (%s, %s, %s, now(), 'draft', %s)
+                    RETURNING data_version, version_code
+                    """,
+                    (
+                        dataset_id,
+                        version_code,
+                        batch_id,
+                        f"{dataset_code} ingest batch {batch_code}",
+                    ),
+                )
+                version_row = cursor.fetchone()
+                if not version_row:
+                    raise QDataValidationError(
+                        f"dataset version was not created for batch {batch_id}"
+                    )
+            self._postgres.commit()
+        except Exception as exc:
+            self._rollback_preserving(exc)
+            raise
+        return VersionedBatch(
+            batch_id=batch_id,
+            data_version=version_row["data_version"],
+            version_code=version_row["version_code"],
+        )
+
+    def _new_batch_code(self, dataset_code: str) -> str:
+        return (
+            f"{self.source_code}-{dataset_code}-"
+            f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+        )
+
+    def _insert_running_batch(
+        self,
+        cursor: Any,
+        dataset_id: int,
+        source_id: int,
+        batch_code: str,
+        trade_date: str | None,
+        row_count: int,
+    ) -> int:
+        cursor.execute(
+            """
+            INSERT INTO qmeta.data_batch (
+                dataset_id, source_id, batch_code, trade_date, natural_date,
+                started_at, finished_at, status, raw_uri, row_count
+            ) VALUES (%s, %s, %s, %s, CURRENT_DATE, now(), NULL, 'running', %s, %s)
+            RETURNING batch_id
+            """,
+            (
+                dataset_id,
+                source_id,
+                batch_code,
+                trade_date,
+                f"raw://{self.source_code}",
+                row_count,
+            ),
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise QDataValidationError(f"data batch was not created: {batch_code}")
+        return row["batch_id"]
 
     def _finish_batches(
         self,
@@ -718,21 +877,149 @@ class SqlDailyBundleLoader:
             return
         if status not in {"success", "failed"}:
             raise QDataValidationError("batch terminal status must be success or failed")
-        error_count = 1 if status == "failed" else 0
         with self._postgres.cursor() as cursor:
             for batch_id in batch_ids:
-                cursor.execute(
-                    """
-                    UPDATE qmeta.data_batch
-                    SET status = %s,
-                        finished_at = now(),
-                        error_count = %s,
-                        error_message = %s
-                    WHERE batch_id = %s
-                    """,
-                    (status, error_count, error_message, batch_id),
-                )
+                self._transition_batch(cursor, batch_id, status, error_message)
         self._postgres.commit()
+
+    def _finish_versioned_batch(
+        self,
+        versioned_batch: VersionedBatch,
+        status: str,
+        error_message: str | None = None,
+    ) -> None:
+        if status not in {"success", "failed"}:
+            raise QDataValidationError("batch terminal status must be success or failed")
+        version_status = "active" if status == "success" else "recalled"
+        with self._postgres.cursor() as cursor:
+            self._transition_batch(
+                cursor,
+                versioned_batch.batch_id,
+                status,
+                error_message,
+            )
+            self._transition_dataset_version(
+                cursor,
+                versioned_batch.data_version,
+                version_status,
+            )
+        self._postgres.commit()
+
+    @staticmethod
+    def _transition_batch(
+        cursor: Any,
+        batch_id: int,
+        status: str,
+        error_message: str | None,
+    ) -> None:
+        error_count = 1 if status == "failed" else 0
+        cursor.execute(
+            """
+            UPDATE qmeta.data_batch
+            SET status = %s,
+                finished_at = now(),
+                error_count = %s,
+                error_message = %s
+            WHERE batch_id = %s AND status = 'running'
+            RETURNING status
+            """,
+            (status, error_count, error_message, batch_id),
+        )
+        if cursor.rowcount not in {0, 1}:
+            raise QDataValidationError(
+                f"batch {batch_id} transition updated {cursor.rowcount} rows"
+            )
+        row = cursor.fetchone()
+        if row and row.get("status") == status:
+            return
+        cursor.execute(
+            "SELECT status FROM qmeta.data_batch WHERE batch_id = %s",
+            (batch_id,),
+        )
+        current = cursor.fetchone()
+        current_status = current.get("status") if current else "missing"
+        if current_status == status:
+            return
+        raise QDataValidationError(
+            f"batch {batch_id} cannot transition from {current_status} to {status}"
+        )
+
+    @staticmethod
+    def _transition_dataset_version(
+        cursor: Any,
+        data_version: int,
+        status: str,
+    ) -> None:
+        cursor.execute(
+            """
+            UPDATE qmeta.dataset_version
+            SET status = %s
+            WHERE data_version = %s AND status = 'draft'
+            RETURNING status
+            """,
+            (status, data_version),
+        )
+        if cursor.rowcount not in {0, 1}:
+            raise QDataValidationError(
+                f"dataset version {data_version} transition updated {cursor.rowcount} rows"
+            )
+        row = cursor.fetchone()
+        if row and row.get("status") == status:
+            return
+        cursor.execute(
+            "SELECT status FROM qmeta.dataset_version WHERE data_version = %s",
+            (data_version,),
+        )
+        current = cursor.fetchone()
+        current_status = current.get("status") if current else "missing"
+        if current_status == status:
+            return
+        raise QDataValidationError(
+            f"dataset version {data_version} cannot transition from "
+            f"{current_status} to {status}"
+        )
+
+    def _record_lifecycle_failure(
+        self,
+        primary_error: Exception,
+        batch_ids: list[int] | None = None,
+        versioned_batch: VersionedBatch | None = None,
+    ) -> None:
+        secondary_errors: list[Exception] = []
+        try:
+            self._postgres.rollback()
+        except Exception as exc:
+            secondary_errors.append(exc)
+        try:
+            if versioned_batch is not None:
+                self._finish_versioned_batch(
+                    versioned_batch,
+                    "failed",
+                    str(primary_error),
+                )
+            elif batch_ids:
+                self._finish_batches(batch_ids, "failed", str(primary_error))
+        except Exception as exc:
+            secondary_errors.append(exc)
+        if secondary_errors:
+            self._attach_lifecycle_errors(primary_error, secondary_errors)
+
+    def _rollback_preserving(self, primary_error: Exception) -> None:
+        try:
+            self._postgres.rollback()
+        except Exception as exc:
+            self._attach_lifecycle_errors(primary_error, [exc])
+
+    @staticmethod
+    def _attach_lifecycle_errors(
+        primary_error: Exception,
+        secondary_errors: list[Exception],
+    ) -> None:
+        existing = tuple(getattr(primary_error, "qdata_lifecycle_errors", ()))
+        try:
+            primary_error.qdata_lifecycle_errors = existing + tuple(secondary_errors)
+        except (AttributeError, TypeError):
+            pass
 
     def _security_id_map(self, symbols: list[str]) -> dict[str, int]:
         unique_symbols = sorted(set(symbols))
