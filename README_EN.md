@@ -80,7 +80,7 @@ Run all offline unittests:
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-Run the focused public timing-arithmetic contract:
+Run the focused public adjusted-reference-arithmetic contract:
 
 ```bash
 python3 -m unittest -v tests.test_factor_api_arithmetic_demo

@@ -20,7 +20,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install pinned packaging toolchain
-        run: python -m pip install --disable-pip-version-check -r .github/ci-toolchain.txt
+        run: python -m pip install --disable-pip-version-check --no-deps -r .github/ci-toolchain.txt
       - name: Verify packaging toolchain versions
         shell: bash
         run: |
@@ -31,6 +31,7 @@ jobs:
               "pip": "26.2.1",
               "setuptools": "84.0.0",
               "wheel": "0.48.0",
+              "packaging": "26.3",
           }
           actual = {package: version(package) for package in expected}
           for package in expected:

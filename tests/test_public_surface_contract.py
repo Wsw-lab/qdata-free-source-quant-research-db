@@ -21,6 +21,7 @@ EXPECTED_TOOLCHAIN = {
     "pip": "26.2.1",
     "setuptools": "84.0.0",
     "wheel": "0.48.0",
+    "packaging": "26.3",
 }
 
 
@@ -59,7 +60,7 @@ class PublicSurfaceContractTest(unittest.TestCase):
         self.assertLess(verify, project_install)
         self.assertLess(project_install, outside_import)
         self.assertIn(
-            "python -m pip install --disable-pip-version-check -r .github/ci-toolchain.txt",
+            "python -m pip install --disable-pip-version-check --no-deps -r .github/ci-toolchain.txt",
             workflow,
         )
         self.assertIn(
@@ -154,7 +155,9 @@ class PublicSurfaceContractTest(unittest.TestCase):
         self.assertIn("未验证下一交易日可交易性", surfaces[README_ZH])
         self.assertIn("不是成交、执行或回测", surfaces[README_ZH])
         self.assertNotIn("时序算术", surfaces[README_ZH])
-        self.assertNotIn("timing arithmetic", surfaces[README_EN].lower())
+        self.assertNotRegex(
+            surfaces[README_EN].lower(), r"timing[- ]arithmetic"
+        )
         for path in (README_EN, TIMING_ADR, notebook_path):
             text = surfaces[path].lower()
             with self.subTest(reference_language=path.relative_to(ROOT)):
