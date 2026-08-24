@@ -48,9 +48,11 @@ contract is requested by a caller that accepts it.
   covering create-copy-EXCHANGE, old-key backup, and OPTIMIZE FINAL. This is
   bounded migration evidence, not a production-backend claim.
 - CI does not run database integration.
-- PostgreSQL array binding, query plans, cross-store transactions, failure
-  recovery, performance, and sustained operation still require real integration
-  tests in addition to deterministic unit fixtures.
+- A disposable Postgres 16 database loaded from migrations `0001`, `0006`, and
+  the seed exercised real PostgreSQL array binding, `DISTINCT ON`, PIT, `asof`,
+  and `vintage` selectors. The ClickHouse side of that focused test remained a
+  deterministic fake. query plans, cross-store transactions, failure recovery,
+  performance, and sustained operation still require real integration tests.
 - A ClickHouse migration can preserve vintages for future merges, but it cannot
   reconstruct rows already collapsed under an older sorting key. Those rows
   must be restored from retained source data or an earlier verified snapshot.
