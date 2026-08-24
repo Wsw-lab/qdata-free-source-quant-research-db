@@ -66,6 +66,30 @@ def _merged_rows(rows: list[dict], key: tuple[str, ...]) -> list[dict]:
 
 
 class ClickHouseVintageSchemaContractTest(unittest.TestCase):
+    def test_migration_freezes_both_sources_before_any_rebuild_work(self) -> None:
+        sql = VINTAGE_MIGRATION.read_text(encoding="utf-8")
+        stop_statements = [
+            "SYSTEM STOP MERGES qts.daily_bar;",
+            "SYSTEM STOP MERGES qts.minute_bar;",
+        ]
+        for statement in stop_statements:
+            self.assertEqual(sql.count(statement), 1, statement)
+
+        rebuild_operations = [
+            "CREATE TABLE qts.daily_bar__0056_rebuild",
+            "CREATE TABLE qts.minute_bar__0056_rebuild",
+            "INSERT INTO qts.daily_bar__0056_rebuild",
+            "INSERT INTO qts.minute_bar__0056_rebuild",
+            "EXCHANGE TABLES qts.daily_bar",
+            "EXCHANGE TABLES qts.minute_bar",
+        ]
+        first_rebuild_operation = min(sql.index(operation) for operation in rebuild_operations)
+        self.assertLess(
+            max(sql.index(statement) for statement in stop_statements),
+            first_rebuild_operation,
+            "both source tables must be frozen before any rebuild DDL/DML or exchange",
+        )
+
     def test_fresh_daily_and_minute_schemas_retain_each_data_version_after_merge(self) -> None:
         fixtures = {
             "qts.daily_bar": [
@@ -128,7 +152,6 @@ class ClickHouseVintageSchemaContractTest(unittest.TestCase):
                 rebuild = f"{table}__0056_rebuild"
                 self.assertIn(f"INSERT INTO {rebuild}", block)
                 self.assertIn(f"FROM {table}", block)
-                self.assertIn(f"SYSTEM STOP MERGES {table}", block)
                 self.assertIn(f"EXCHANGE TABLES {table} AND {rebuild}", block)
                 self.assertIn(f"SYSTEM STOP MERGES {rebuild}", block)
                 self.assertIn(f"SYSTEM START MERGES {table}", block)
@@ -203,11 +226,23 @@ class ClickHouseVintageMigrationIntegrationTest(unittest.TestCase):
         }
         qualified_tables = []
         try:
+            # Build one old-key part containing all four rows under plain
+            # MergeTree, then attach it to the real ReplacingMergeTree.  A
+            # single part cannot race a background merge before migration, so
+            # the selector does not pre-stop either canonical source.
             for source_table, spec in specs.items():
                 with self.subTest(table=source_table):
                     table = f"qdata_vintage_{source_table.rsplit('.', 1)[1]}_{uuid4().hex[:10]}"
                     qualified = f"default.{table}"
+                    fixture_qualified = f"{qualified}__fixture_source"
+                    rebuild_qualified = f"{qualified}__0056_rebuild"
+                    spec["table"] = table
+                    spec["qualified"] = qualified
+                    spec["fixture_qualified"] = fixture_qualified
+                    spec["rebuild_qualified"] = rebuild_qualified
                     qualified_tables.append(qualified)
+                    qualified_tables.append(fixture_qualified)
+                    qualified_tables.append(rebuild_qualified)
                     source_ddl = _table_block(
                         INIT_DDL.read_text(encoding="utf-8"), source_table
                     )
@@ -223,13 +258,25 @@ class ClickHouseVintageMigrationIntegrationTest(unittest.TestCase):
                         count=1,
                     )
                     client.command(old_key_ddl.rstrip(";"))
-                    client.command(f"SYSTEM STOP MERGES {qualified}")
-                    for row in spec["rows"]:
-                        client.insert(
-                            qualified,
-                            [row],
-                            column_names=spec["column_names"],
-                        )
+                    fixture_ddl = old_key_ddl.replace(
+                        f"CREATE TABLE {qualified}",
+                        f"CREATE TABLE {fixture_qualified}",
+                        1,
+                    ).replace(
+                        "ENGINE = ReplacingMergeTree(ingest_time)",
+                        "ENGINE = MergeTree",
+                        1,
+                    )
+                    client.command(fixture_ddl.rstrip(";"))
+                    client.insert(
+                        fixture_qualified,
+                        spec["rows"],
+                        column_names=spec["column_names"],
+                    )
+                    client.command(
+                        f"ALTER TABLE {qualified} "
+                        f"ATTACH PARTITION 202401 FROM {fixture_qualified}"
+                    )
                     source_rows = client.query(
                         f"""
                         SELECT data_version, close, ingest_time
@@ -257,16 +304,29 @@ class ClickHouseVintageMigrationIntegrationTest(unittest.TestCase):
                         WHERE database = 'default' AND table = '{table}' AND active
                         """
                     ).result_rows
-                    self.assertEqual(active_parts, [(4,)])
+                    self.assertEqual(active_parts, [(1,)])
 
-                    migration_block = _migration_block(migration, source_table)
-                    rendered_block = migration_block.replace(source_table, qualified)
-                    rebuild_qualified = f"{qualified}__0056_rebuild"
-                    qualified_tables.append(rebuild_qualified)
-                    for statement in rendered_block.split(";"):
-                        if statement.strip():
-                            client.command(statement)
+            # Execute the complete migration once for both tables.  Its first
+            # two executable statements—not fixture setup—must freeze daily
+            # and minute before any rebuild work begins.
+            rendered_migration = migration
+            for source_table, spec in specs.items():
+                rendered_migration = rendered_migration.replace(
+                    source_table, spec["qualified"]
+                )
+            executable_sql = "\n".join(
+                line for line in rendered_migration.splitlines()
+                if not line.lstrip().startswith("--")
+            )
+            for statement in executable_sql.split(";"):
+                if statement.strip():
+                    client.command(statement)
 
+            for source_table, spec in specs.items():
+                with self.subTest(table=source_table):
+                    table = spec["table"]
+                    qualified = spec["qualified"]
+                    rebuild_qualified = spec["rebuild_qualified"]
                     sorting_key_rows = client.query(
                         f"""
                         SELECT sorting_key

@@ -13,13 +13,17 @@
 -- the new durable table, while __0056_rebuild points to the complete old table
 -- and remains available as an audit/rollback copy.  Do not drop that copy until
 -- row counts and representative vintages have been independently verified.
--- Source merges are stopped before copy, the old-key backup remains stopped
--- after exchange, and merges are explicitly enabled on the new canonical table.
+-- Both source merges are stopped before any rebuild DDL/DML, the old-key backup
+-- remains stopped after exchange, and merges are explicitly enabled on the new
+-- canonical table.
 -- If this script aborts before an EXCHANGE, resume merges on that source table
 -- before returning ingestion to service.
 --
 -- IMPORTANT: versions already removed by an old-key merge cannot be recovered
 -- by this migration and must be restored from upstream/raw snapshots.
+
+SYSTEM STOP MERGES qts.daily_bar;
+SYSTEM STOP MERGES qts.minute_bar;
 
 CREATE TABLE qts.daily_bar__0056_rebuild
 (
@@ -46,8 +50,6 @@ CREATE TABLE qts.daily_bar__0056_rebuild
 ENGINE = ReplacingMergeTree(ingest_time)
 PARTITION BY toYYYYMM(trade_date)
 ORDER BY (security_id, trade_date, data_version);
-
-SYSTEM STOP MERGES qts.daily_bar;
 
 INSERT INTO qts.daily_bar__0056_rebuild
 (
@@ -87,8 +89,6 @@ CREATE TABLE qts.minute_bar__0056_rebuild
 ENGINE = ReplacingMergeTree(ingest_time)
 PARTITION BY toYYYYMM(trade_date)
 ORDER BY (security_id, trade_date, bar_time, data_version);
-
-SYSTEM STOP MERGES qts.minute_bar;
 
 INSERT INTO qts.minute_bar__0056_rebuild
 (
