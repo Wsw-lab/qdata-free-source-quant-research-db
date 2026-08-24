@@ -1,0 +1,50 @@
+# ADR 0001: Immutable research snapshot contract
+
+- Status: Accepted
+- Date: 2026-08-24
+
+## Context
+
+A historical value is not automatically safe for research merely because its
+economic effective date is in the past. Announcements, vendor delivery,
+backfills, and later revisions can all make a value unavailable at a simulated
+decision time. Queries against a mutable `latest` table also cannot reproduce
+an earlier experiment.
+
+## Decision
+
+Formal research runs consume an immutable `research_snapshot_v1`, never a live
+provider response or an unpinned `latest` query.
+
+Records that can affect a decision carry the following meanings when the source
+supports them:
+
+- `event_time`: when the economic or market event happened;
+- `published_at`: when the source made the value public;
+- `first_seen_at`: when QData first obtained the value;
+- `available_at`: the conservative research availability time, no earlier than
+  both publication and first observation;
+- `revision_id`: the identity of a later correction or restatement.
+
+Every snapshot has a canonical JSON manifest containing its schema version,
+cutoff time, timezone, source and data version, per-dataset row counts, and
+SHA-256 digests.  Verification fails closed for an unknown schema, a missing or
+changed file, a duplicate primary key, a missing critical field, or a record
+whose `available_at` is later than the snapshot cutoff.
+
+Minute data is never silently synthesized from a daily bar.  An unavailable
+frequency is reported as unsupported unless an explicitly named estimated-data
+contract is requested by a caller that accepts it.
+
+## Consequences
+
+- A snapshot is deliberately more conservative than a mutable database query.
+- Historical backfills without credible delivery timestamps remain labelled as
+  backfills; strict research must not pretend they were observed historically.
+- Storage and query backends may evolve independently as long as the exported
+  snapshot contract and hashes remain stable.
+- Real PostgreSQL/ClickHouse integration tests are still required in addition
+  to deterministic unit fixtures.
+- A ClickHouse migration can preserve vintages for future merges, but it cannot
+  reconstruct rows already collapsed under an older sorting key. Those rows
+  must be restored from retained source data or an earlier verified snapshot.
