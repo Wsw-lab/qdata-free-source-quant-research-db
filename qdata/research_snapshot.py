@@ -10,6 +10,11 @@ This module is intentionally narrow: it defines the interchange contract
 between QData and a research consumer.  It does not claim that an upstream
 provider is point-in-time correct; it makes the provider's cutoff and
 ``available_at`` assertions explicit and independently verifiable.
+For paired daily-bar and tradability rows, signal availability is the later of
+their two timestamps and must fall on the trade date in the manifest timezone.
+Membership completeness is enforced only across market dates observed in the
+snapshot because v1 does not contain an authoritative exchange calendar; an
+entirely absent market date therefore cannot be detected by this contract.
 Snapshot artifacts are data-contract evidence, not strategy or performance
 evidence.
 """
@@ -28,7 +33,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Container, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -331,7 +336,14 @@ def build_research_snapshot(
 def verify_research_snapshot(
     snapshot_dir: str | os.PathLike[str],
 ) -> dict[str, Any]:
-    """Verify hashes, manifest, schemas, canonical bytes, and PIT cutoff."""
+    """Verify snapshot integrity and the bounded v1 semantic contract.
+
+    Verification covers hashes, canonical manifest/CSV bytes, schemas, PIT
+    cutoff, paired daily-bar/tradability keys, later-input signal availability,
+    and active-membership coverage on every *observed* market date.  V1 has no
+    exchange calendar, so it cannot prove that a date missing for all symbols
+    should have been present.
+    """
 
     root = Path(snapshot_dir)
     directory_fd, directory_identity = _open_regular_directory(root)
@@ -1088,21 +1100,17 @@ def _validate_cross_dataset_contract(
         (date.fromisoformat(trade_date_text), trade_date_text)
         for trade_date_text in sorted({key[1] for key in daily_keys})
     ]
-    missing_membership_keys = [
-        (symbol, market_date_text)
-        for symbol, intervals in sorted(memberships.items())
-        for market_date, market_date_text in market_dates
-        if any(
-            start <= market_date and (end is None or market_date < end)
-            for start, end in intervals
-        )
-        and (symbol, market_date_text) not in daily_keys
-    ]
+    missing_membership_keys = _first_missing_membership_keys(
+        memberships,
+        market_dates,
+        daily_keys,
+        limit=5,
+    )
     if missing_membership_keys:
         raise SnapshotValidationError(
             "security_membership has missing explicit daily_bar/tradability "
             "coverage for active symbol/date keys; "
-            f"missing={missing_membership_keys[:5]}"
+            f"missing={missing_membership_keys}"
         )
 
     for symbol, trade_date_text in sorted(daily_keys):
@@ -1121,6 +1129,31 @@ def _validate_cross_dataset_contract(
             raise SnapshotValidationError(
                 f"fundamental_pit symbol {row['symbol']} has no security membership"
             )
+
+
+def _first_missing_membership_keys(
+    memberships: Mapping[str, Sequence[tuple[date, date | None]]],
+    market_dates: Sequence[tuple[date, str]],
+    present_keys: Container[tuple[str, str]],
+    *,
+    limit: int,
+) -> list[tuple[str, str]]:
+    if limit <= 0:
+        return []
+
+    missing: list[tuple[str, str]] = []
+    for symbol, intervals in sorted(memberships.items()):
+        for market_date, market_date_text in market_dates:
+            is_active = any(
+                start <= market_date and (end is None or market_date < end)
+                for start, end in intervals
+            )
+            if not is_active or (symbol, market_date_text) in present_keys:
+                continue
+            missing.append((symbol, market_date_text))
+            if len(missing) == limit:
+                return missing
+    return missing
 
 
 def _validate_signal_availability_dates(

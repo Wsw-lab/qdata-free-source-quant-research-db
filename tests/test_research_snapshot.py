@@ -3,12 +3,14 @@ from __future__ import annotations
 import copy
 import csv
 import hashlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import date, timedelta
 from decimal import localcontext
 from pathlib import Path
 from unittest.mock import patch
@@ -64,6 +66,51 @@ def _rewrite_and_resign_dataset(
     manifest["datasets"][dataset_name]["sha256"] = hashlib.sha256(
         rewritten_payload
     ).hexdigest()
+    manifest_without_id = dict(manifest)
+    manifest_without_id.pop("snapshot_id")
+    manifest["snapshot_id"] = "sha256:" + hashlib.sha256(
+        _canonical_json(manifest_without_id)
+    ).hexdigest()
+    manifest_path.write_bytes(_canonical_json(manifest))
+
+
+def _remove_market_date_and_resign(root: Path, trade_date: str) -> None:
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    for dataset_name in ("daily_bar", "tradability"):
+        dataset_path = root / f"{dataset_name}.csv"
+        with dataset_path.open(encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = reader.fieldnames
+            rows = list(reader)
+        if fieldnames is None:
+            raise AssertionError(f"{dataset_name}.csv has no header")
+        retained = [row for row in rows if row["trade_date"] != trade_date]
+        if len(rows) - len(retained) != 2:
+            raise AssertionError(
+                f"expected exactly two {dataset_name} rows for {trade_date}"
+            )
+
+        output = io.StringIO(newline="")
+        writer = csv.DictWriter(
+            output,
+            fieldnames=fieldnames,
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        writer.writerows(retained)
+        payload = output.getvalue().encode("utf-8")
+        dataset_path.write_bytes(payload)
+
+        metadata = manifest["datasets"][dataset_name]
+        metadata["sha256"] = hashlib.sha256(payload).hexdigest()
+        metadata["row_count"] = 4
+        metadata["date_range"] = {
+            "start": "2024-01-02",
+            "end": "2024-01-04",
+        }
+
     manifest_without_id = dict(manifest)
     manifest_without_id.pop("snapshot_id")
     manifest["snapshot_id"] = "sha256:" + hashlib.sha256(
@@ -242,6 +289,31 @@ class ResearchSnapshotTest(unittest.TestCase):
                     ):
                         verify_research_snapshot(root)
 
+    def test_builder_accepts_signal_when_later_input_is_on_trade_date(self) -> None:
+        datasets = synthetic_datasets()
+        tradability = _market_row(
+            datasets, "tradability", "600519.SH", "2024-01-03"
+        )
+        tradability["available_at"] = "2024-01-02T23:59:00+08:00"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self._build(Path(tmp) / "snapshot", datasets)
+
+        self.assertEqual(manifest["schema_version"], SCHEMA_VERSION)
+
+    def test_verify_accepts_resigned_snapshot_with_whole_market_date_absent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "snapshot"
+            self._build(root)
+            _remove_market_date_and_resign(root, "2024-01-03")
+
+            verified = verify_research_snapshot(root)
+
+        self.assertEqual(verified["datasets"]["daily_bar"]["row_count"], 4)
+        self.assertEqual(verified["datasets"]["tradability"]["row_count"], 4)
+
     def test_verify_rejects_unknown_schema_even_with_canonical_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "snapshot"
@@ -301,6 +373,45 @@ class ResearchSnapshotTest(unittest.TestCase):
                 "missing explicit daily_bar/tradability coverage.*600519.SH.*2024-01-03",
             ):
                 self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_missing_membership_diagnostics_stop_after_five_missing_keys(
+        self,
+    ) -> None:
+        class LookupBudget:
+            def __init__(self) -> None:
+                self.lookups = 0
+
+            def __contains__(self, key) -> bool:
+                self.lookups += 1
+                if self.lookups > 5:
+                    raise AssertionError("coverage validation scanned past its bound")
+                return False
+
+        start = date(2024, 1, 1)
+        market_dates = [
+            (start + timedelta(days=offset), f"2024-01-{offset + 1:02d}")
+            for offset in range(10)
+        ]
+        present_keys = LookupBudget()
+
+        missing = research_snapshot_module._first_missing_membership_keys(
+            {"600519.SH": [(start, None)]},
+            market_dates,
+            present_keys,
+            limit=5,
+        )
+
+        self.assertEqual(
+            missing,
+            [
+                ("600519.SH", "2024-01-01"),
+                ("600519.SH", "2024-01-02"),
+                ("600519.SH", "2024-01-03"),
+                ("600519.SH", "2024-01-04"),
+                ("600519.SH", "2024-01-05"),
+            ],
+        )
+        self.assertEqual(present_keys.lookups, 5)
 
     def test_builder_does_not_require_market_keys_outside_membership_interval(
         self,

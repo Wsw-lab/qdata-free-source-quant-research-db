@@ -46,7 +46,7 @@ Verify it before research consumption:
 python3 examples/build_research_snapshot.py verify /tmp/qdata-research-snapshot-v1
 ```
 
-Formal research inputs should pin a verified immutable snapshot instead of consuming an unpinned `latest` response. An economic date does not prove that a value was known at that time; `available_at` must be no later than the snapshot cutoff. See the [immutable snapshot ADR](docs/adr/0001-research-snapshot-and-time-contract.md).
+Formal research inputs should pin a verified immutable snapshot instead of consuming an unpinned `latest` response. An economic date does not prove that a value was known at that time; `available_at` must be no later than the snapshot cutoff. For paired market rows, signal availability is the later of the daily-bar and tradability timestamps and must fall on `trade_date` in the manifest timezone. V1 checks active-security completeness only on market dates observed in the snapshot; it has no exchange calendar and cannot detect a whole date omitted for every symbol. Research that needs session continuity must pin and validate an authoritative calendar separately. See the [immutable snapshot ADR](docs/adr/0001-research-snapshot-and-time-contract.md).
 
 ## Quickstart
 

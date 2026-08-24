@@ -32,6 +32,26 @@ SHA-256 digests.  Verification fails closed for an unknown schema, a missing or
 changed file, a duplicate primary key, a missing critical field, or a record
 whose `available_at` is later than the snapshot cutoff.
 
+`daily_bar` and `tradability` must have identical `(symbol, trade_date)` keys.
+For each pair, signal availability is `max(daily_bar.available_at,
+tradability.available_at)`; that later timestamp must fall on `trade_date` in
+the manifest timezone. An earlier tradability timestamp may therefore be on
+the previous local date when the daily bar is the later, decision-controlling
+input.
+
+V1 derives its market-date set from dates observed in the paired market rows.
+For every such observed date, each security with an active half-open membership
+interval `[valid_from, valid_to)` must have explicit daily-bar and tradability
+rows, including an explicit non-tradable row for a suspension. Missing-key
+diagnostics stop after the first five deterministic examples instead of
+materializing every missing symbol/date pair.
+
+V1 does not include an authoritative exchange calendar. It therefore cannot
+distinguish a legitimately closed date from a date omitted for every symbol,
+and it accepts an otherwise valid snapshot with such a whole-market date
+absent. Research that requires session continuity must validate against a
+pinned exchange calendar before building or consuming the snapshot.
+
 Minute data is never silently synthesized from a daily bar.  An unavailable
 frequency is reported as unsupported unless an explicitly named estimated-data
 contract is requested by a caller that accepts it.
@@ -43,6 +63,8 @@ contract is requested by a caller that accepts it.
   backfills; strict research must not pretend they were observed historically.
 - Storage and query backends may evolve independently as long as the exported
   snapshot contract and hashes remain stable.
+- Completeness means full active-membership coverage on observed market dates,
+  not proof of exchange-calendar continuity.
 - The ClickHouse migration selector was locally integration-tested in Docker on
   ClickHouse 24.8.14.39 with fresh old-key full schemas and four source rows in one old-key part,
   covering create-copy-EXCHANGE, old-key backup, and OPTIMIZE FINAL. This is

@@ -46,7 +46,7 @@ python3 examples/build_research_snapshot.py build /tmp/qdata-research-snapshot-v
 python3 examples/build_research_snapshot.py verify /tmp/qdata-research-snapshot-v1
 ```
 
-正式研究输入应固定到已验证的不可变 snapshot，不应直接依赖未固定的 `latest` 响应。字段的经济日期不等于研究者当时已知；`available_at` 必须不晚于 snapshot cutoff。完整决策见[不可变快照 ADR](docs/adr/0001-research-snapshot-and-time-contract.md)。
+正式研究输入应固定到已验证的不可变 snapshot，不应直接依赖未固定的 `latest` 响应。字段的经济日期不等于研究者当时已知；`available_at` 必须不晚于 snapshot cutoff。成对行情的信号可用时间取 daily bar 与 tradability 的较晚时间，并要求其在 manifest 时区内落在 `trade_date`。V1 只对 snapshot 中实际出现的市场日期检查活跃证券完整性；它不含交易所日历，因而无法识别所有证券均缺失的整日，要求连续交易日的研究需另行固定并校验权威日历。完整决策见[不可变快照 ADR](docs/adr/0001-research-snapshot-and-time-contract.md)。
 
 ## Quickstart
 
