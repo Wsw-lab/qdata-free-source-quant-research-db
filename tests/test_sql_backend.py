@@ -29,6 +29,8 @@ class FakePostgres:
                 "security_id": 1000001, "trade_date": "2024-01-02",
                 "factor_forward": 0.5, "factor_backward": 2.0,
                 "revision_id": 1, "batch_id": 2,
+                "dataset_code": "daily_bar", "batch_status": "success",
+                "batch_finished_at": aware("2024-01-02T17:00:00+08:00"),
                 "announce_time": aware("2024-01-02T16:00:00+08:00"),
                 "effective_time": aware("2024-01-02T16:00:00+08:00"),
                 "ingest_time": aware("2024-01-02T17:00:00+08:00"),
@@ -110,10 +112,11 @@ class FakePostgres:
         return rows
 
     def _adjustment_factor_rows(self, sql, params):
-        cutoff = params.get("asof_time")
+        cutoff = params.get("knowledge_cutoff", params.get("asof_time"))
         if isinstance(cutoff, str):
             cutoff = aware(cutoff)
         allowed_batches = set(params.get("allowed_batch_ids") or [])
+        knowledge_datasets = set(params.get("knowledge_dataset_codes") or [])
         if params.get("batch_id") is not None:
             allowed_batches = {params["batch_id"]}
         rows = []
@@ -124,17 +127,41 @@ class FakePostgres:
                 continue
             if "batch_id = ANY(%(allowed_batch_ids)s)" in sql and item["batch_id"] not in allowed_batches:
                 continue
+            if ("dc.dataset_code = ANY(%(knowledge_dataset_codes)s)" in sql
+                    and item["dataset_code"] not in knowledge_datasets):
+                continue
+            if "db.status = 'success'" in sql and item["batch_status"] != "success":
+                continue
             if cutoff is not None:
+                if ("db.finished_at IS NOT NULL" in sql
+                        and item["batch_finished_at"] is None):
+                    continue
+                if ("db.finished_at <= %(knowledge_cutoff)s" in sql
+                        and item["batch_finished_at"] > cutoff):
+                    continue
+                if ("af.ingest_time <= %(knowledge_cutoff)s" in sql
+                        and item["ingest_time"] > cutoff):
+                    continue
                 if "ingest_time <= %(asof_time)s" in sql and item["ingest_time"] > cutoff:
                     continue
-                if "announce_time IS NOT NULL" in sql and item["announce_time"] is None:
+                if ("announce_time IS NOT NULL" in sql or "af.announce_time IS NOT NULL" in sql) \
+                        and item["announce_time"] is None:
                     continue
                 if ("announce_time <= %(asof_time)s" in sql and item["announce_time"] is not None
                         and item["announce_time"] > cutoff):
                     continue
-                if "effective_time IS NOT NULL" in sql and item["effective_time"] is None:
+                if ("af.announce_time <= %(knowledge_cutoff)s" in sql
+                        and item["announce_time"] is not None
+                        and item["announce_time"] > cutoff):
+                    continue
+                if ("effective_time IS NOT NULL" in sql or "af.effective_time IS NOT NULL" in sql) \
+                        and item["effective_time"] is None:
                     continue
                 if ("effective_time <= %(asof_time)s" in sql and item["effective_time"] is not None
+                        and item["effective_time"] > cutoff):
+                    continue
+                if ("af.effective_time <= %(knowledge_cutoff)s" in sql
+                        and item["effective_time"] is not None
                         and item["effective_time"] > cutoff):
                     continue
             rows.append(dict(item))
@@ -339,9 +366,61 @@ class SqlBackendTest(unittest.TestCase):
         self.assertEqual(rows[0]["close"], 5.0)
         factor_sql, factor_params = next((sql, params) for sql, params in postgres.queries
                                          if "FROM qmeta.adjustment_factor" in sql)
-        self.assertIn("announce_time <= %(asof_time)s", factor_sql)
-        self.assertIn("effective_time <= %(asof_time)s", factor_sql)
-        self.assertEqual(factor_params["allowed_batch_ids"], [2])
+        self.assertIn("af.announce_time <= %(knowledge_cutoff)s", factor_sql)
+        self.assertIn("af.effective_time <= %(knowledge_cutoff)s", factor_sql)
+        self.assertEqual(factor_params["knowledge_cutoff"], aware("2024-01-02T18:00:00+08:00"))
+
+    def test_latest_adjustment_uses_only_successful_independent_correction(self) -> None:
+        factors = [
+            self._factor_revision(1, 2, 0.5, "17:00"),
+            self._factor_revision(
+                2, 3, 0.25, "17:30", dataset_code="adjustment_factor",
+                batch_finished_at=aware("2024-01-02T19:00:00+08:00"),
+            ),
+            self._factor_revision(
+                3, 4, 0.1, "20:00", dataset_code="adjustment_factor", batch_status="failed"
+            ),
+            self._factor_revision(
+                4, 5, 0.05, "21:00", dataset_code="adjustment_factor", batch_status="running"
+            ),
+        ]
+        postgres = FakePostgres(adjustment_factors=factors)
+
+        rows = self._client(postgres, FakeClickHouse()).get_price(
+            symbols=["600519.SH"], start_date="2024-01-02", end_date="2024-01-02",
+            adjust="forward",
+        )
+
+        self.assertEqual(rows[0]["close"], 2.625)
+        factor_sql, factor_params = next((sql, params) for sql, params in postgres.queries
+                                         if "FROM qmeta.adjustment_factor" in sql)
+        self.assertIn("JOIN qmeta.data_batch db", factor_sql)
+        self.assertIn("db.status = 'success'", factor_sql)
+        self.assertEqual(set(factor_params["knowledge_dataset_codes"]),
+                         {"daily_bar", "adjustment_factor"})
+
+    def test_asof_adjustment_switches_only_after_correction_is_published(self) -> None:
+        factors = [
+            self._factor_revision(1, 2, 0.5, "17:00"),
+            self._factor_revision(
+                2, 3, 0.25, "17:30", dataset_code="adjustment_factor",
+                batch_finished_at=aware("2024-01-02T19:00:00+08:00"),
+            ),
+        ]
+        for cutoff, expected_close in (
+            ("2024-01-02T18:00:00+08:00", 5.25),
+            ("2024-01-02T20:00:00+08:00", 2.625),
+        ):
+            with self.subTest(cutoff=cutoff):
+                postgres = FakePostgres(adjustment_factors=factors)
+                rows = self._client(postgres, FakeClickHouse()).get_price(
+                    symbols=["600519.SH"], start_date="2024-01-02", end_date="2024-01-02",
+                    adjust="forward", query_mode="asof", asof_time=cutoff,
+                )
+                self.assertEqual(rows[0]["close"], expected_close)
+                factor_sql = next(sql for sql, _ in postgres.queries
+                                  if "FROM qmeta.adjustment_factor" in sql)
+                self.assertIn("db.finished_at <= %(knowledge_cutoff)s", factor_sql)
 
     def test_public_adjustment_factor_latest_returns_only_latest_revision(self) -> None:
         factors = [self._factor_revision(1, 2, 0.5, "17:00"),
@@ -367,19 +446,27 @@ class SqlBackendTest(unittest.TestCase):
 
         self.assertEqual(rows[0]["close"], 5.25)
 
-    def test_vintage_adjustment_uses_only_its_daily_version_batch(self) -> None:
-        exact = self._factor_revision(1, 2, 0.5, "17:00")
-        wrong_batch = self._factor_revision(2, 999, 0.25, "19:00")
-        postgres = FakePostgres(adjustment_factors=[exact, wrong_batch])
+    def test_vintage_adjustment_is_frozen_at_daily_version_publication(self) -> None:
+        daily = self._factor_revision(1, 2, 0.5, "16:00")
+        correction_before_publication = self._factor_revision(
+            2, 3, 0.25, "16:30", dataset_code="adjustment_factor"
+        )
+        correction_after_publication = self._factor_revision(
+            3, 4, 0.1, "16:45", dataset_code="adjustment_factor",
+            batch_finished_at=aware("2024-01-02T19:00:00+08:00"),
+        )
+        postgres = FakePostgres(adjustment_factors=[
+            daily, correction_before_publication, correction_after_publication,
+        ])
 
         rows = self._client(postgres, FakeClickHouse()).get_price(
             symbols=["600519.SH"], start_date="2024-01-02", end_date="2024-01-02",
             adjust="forward", query_mode="vintage", data_version="daily_bar:seed-v1")
 
-        self.assertEqual(rows[0]["close"], 5.25)
+        self.assertEqual(rows[0]["close"], 2.625)
         _, factor_params = next((sql, params) for sql, params in postgres.queries
                                 if "FROM qmeta.adjustment_factor" in sql)
-        self.assertEqual(factor_params["allowed_batch_ids"], [2])
+        self.assertEqual(factor_params["knowledge_cutoff"], aware("2024-01-02T17:01:00+08:00"))
 
     def test_adjusted_price_fails_closed_when_exact_factor_is_missing(self) -> None:
         client = self._client(FakePostgres(adjustment_factors=[]), FakeClickHouse())
@@ -453,11 +540,16 @@ class SqlBackendTest(unittest.TestCase):
                 "ingest_time": aware(f"2024-01-02T{time_text}:00+08:00")}
 
     @staticmethod
-    def _factor_revision(revision_id, batch_id, factor_forward, time_text):
+    def _factor_revision(
+        revision_id, batch_id, factor_forward, time_text,
+        dataset_code="daily_bar", batch_status="success", batch_finished_at=None,
+    ):
         timestamp = aware(f"2024-01-02T{time_text}:00+08:00")
         return {"security_id": 1000001, "trade_date": "2024-01-02",
                 "factor_forward": factor_forward, "factor_backward": 1 / factor_forward,
                 "revision_id": revision_id, "batch_id": batch_id,
+                "dataset_code": dataset_code, "batch_status": batch_status,
+                "batch_finished_at": batch_finished_at or timestamp,
                 "announce_time": timestamp, "effective_time": timestamp, "ingest_time": timestamp}
 
     @staticmethod

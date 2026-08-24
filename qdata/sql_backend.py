@@ -236,12 +236,19 @@ class SqlBackend:
         )
         normalized = normalize_rows(rows)
         if adjust != "none" and frequency == "1d":
+            knowledge_cutoff = cutoff
+            if query_mode == "vintage":
+                publication_time = allowed_versions[0].get("finished_at")
+                if publication_time is None:
+                    raise QDataNotFoundError(
+                        "Selected daily-bar data version has no publication time"
+                    )
+                knowledge_cutoff = self._parse_aware_datetime(publication_time)
             factors = self._get_adjustment_factor_map(
                 list(security_map),
                 start_date,
                 end_date,
-                asof_time=cutoff,
-                allowed_batch_ids=[row["batch_id"] for row in allowed_versions],
+                knowledge_cutoff=knowledge_cutoff,
             )
             normalized = [self._apply_adjustment(row, adjust, factors) for row in normalized]
         for row in normalized:
@@ -877,9 +884,12 @@ class SqlBackend:
             )
             params["asof_time"] = asof_time
         elif query_mode == "vintage":
-            where.append(
-                "(dv.version_code = %(requested_data_version)s "
-                "OR CAST(dv.data_version AS TEXT) = %(requested_data_version)s)"
+            where.extend(
+                [
+                    "db.finished_at IS NOT NULL",
+                    "(dv.version_code = %(requested_data_version)s "
+                    "OR CAST(dv.data_version AS TEXT) = %(requested_data_version)s)",
+                ]
             )
             params["requested_data_version"] = str(requested_version)
 
@@ -921,38 +931,42 @@ class SqlBackend:
         security_ids: list[int],
         start_date: str,
         end_date: str,
-        asof_time: datetime | None = None,
-        allowed_batch_ids: list[int] | None = None,
+        knowledge_cutoff: datetime | None = None,
     ) -> dict[tuple[int, str], dict[str, Any]]:
         where = [
-            "security_id = ANY(%(security_ids)s)",
-            "trade_date BETWEEN %(start_date)s AND %(end_date)s",
-            "batch_id = ANY(%(allowed_batch_ids)s)",
+            "af.security_id = ANY(%(security_ids)s)",
+            "af.trade_date BETWEEN %(start_date)s AND %(end_date)s",
+            "dc.dataset_code = ANY(%(knowledge_dataset_codes)s)",
+            "db.status = 'success'",
+            "db.finished_at IS NOT NULL",
         ]
         params: dict[str, Any] = {
             "security_ids": security_ids,
             "start_date": start_date,
             "end_date": end_date,
-            "allowed_batch_ids": allowed_batch_ids or [],
+            "knowledge_dataset_codes": ["daily_bar", "adjustment_factor"],
         }
-        if asof_time is not None:
+        if knowledge_cutoff is not None:
             where.extend(
                 [
-                    "ingest_time <= %(asof_time)s",
-                    "announce_time IS NOT NULL",
-                    "announce_time <= %(asof_time)s",
-                    "effective_time IS NOT NULL",
-                    "effective_time <= %(asof_time)s",
+                    "db.finished_at <= %(knowledge_cutoff)s",
+                    "af.ingest_time <= %(knowledge_cutoff)s",
+                    "af.announce_time IS NOT NULL",
+                    "af.announce_time <= %(knowledge_cutoff)s",
+                    "af.effective_time IS NOT NULL",
+                    "af.effective_time <= %(knowledge_cutoff)s",
                 ]
             )
-            params["asof_time"] = asof_time
+            params["knowledge_cutoff"] = knowledge_cutoff
         rows = self.postgres.fetch_all(
             f"""
             SELECT DISTINCT ON (security_id, trade_date)
-                security_id, trade_date, factor_forward, factor_backward
-            FROM qmeta.adjustment_factor
+                af.security_id, af.trade_date, af.factor_forward, af.factor_backward
+            FROM qmeta.adjustment_factor af
+            JOIN qmeta.data_batch db ON db.batch_id = af.batch_id
+            JOIN qmeta.dataset_catalog dc ON dc.dataset_id = db.dataset_id
             {self._where(where)}
-            ORDER BY security_id, trade_date, revision_id DESC, ingest_time DESC
+            ORDER BY af.security_id, af.trade_date, af.revision_id DESC, af.ingest_time DESC
             """,
             params,
         )

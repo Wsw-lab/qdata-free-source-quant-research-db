@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS qts.daily_bar
 )
 ENGINE = ReplacingMergeTree(ingest_time)
 PARTITION BY toYYYYMM(trade_date)
-ORDER BY (security_id, trade_date);
+ORDER BY (security_id, trade_date, data_version);
 
 CREATE TABLE IF NOT EXISTS qts.minute_bar
 (
@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS qts.minute_bar
 )
 ENGINE = ReplacingMergeTree(ingest_time)
 PARTITION BY toYYYYMM(trade_date)
-ORDER BY (security_id, trade_date, bar_time);
+ORDER BY (security_id, trade_date, bar_time, data_version);
 
 CREATE TABLE IF NOT EXISTS qts.factor_value_daily
 (
