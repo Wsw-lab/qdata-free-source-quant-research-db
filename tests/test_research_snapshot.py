@@ -187,6 +187,36 @@ class ResearchSnapshotTest(unittest.TestCase):
                 self.assertEqual(hashlib.sha256(payload).hexdigest(), metadata["sha256"])
                 self.assertEqual(metadata["path"], f"{name}.csv")
 
+    def test_builder_rejects_inconsistent_adjusted_close_triplet(self) -> None:
+        datasets = synthetic_datasets()
+        daily = _market_row(datasets, "daily_bar", "600519.SH", "2024-01-02")
+        daily["adjustment_factor"] = "0.5"
+        daily["close_adjusted"] = daily["close_raw"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(
+                SnapshotValidationError,
+                "close_adjusted.*close_raw.*adjustment_factor",
+            ):
+                self._build(Path(tmp) / "snapshot", datasets)
+
+    def test_verify_rejects_resigned_inconsistent_adjusted_close_triplet(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "snapshot"
+            self._build(root)
+            _rewrite_and_resign_dataset(
+                root,
+                "daily_bar",
+                b"1728,1,",
+                b"1728,2,",
+            )
+
+            with self.assertRaisesRegex(
+                SnapshotVerificationError,
+                "close_adjusted.*close_raw.*adjustment_factor",
+            ):
+                verify_research_snapshot(root)
+
     def test_repeated_build_is_byte_deterministic_and_same_path_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             first = Path(tmp) / "first"
@@ -522,6 +552,7 @@ class ResearchSnapshotTest(unittest.TestCase):
             self._build(root)
             datasets = synthetic_datasets()
             datasets["daily_bar"][0]["close_raw"] = "1729"
+            datasets["daily_bar"][0]["close_adjusted"] = "1729"
 
             with self.assertRaisesRegex(SnapshotImmutableError, "different content"):
                 self._build(root, datasets)

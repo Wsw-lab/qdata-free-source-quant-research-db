@@ -101,7 +101,12 @@ CREATE TABLE IF NOT EXISTS qmeta.security_master (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (asset_type, exchange, current_symbol),
     CHECK (asset_type IN ('stock', 'etf', 'lof', 'convertible_bond', 'index', 'future', 'option', 'fund')),
-    CHECK (current_status IN ('prelisted', 'active', 'suspended', 'delisted', 'terminated', 'unknown'))
+    CONSTRAINT ck_security_master_current_status CHECK (
+        current_status IN (
+            'prelisted', 'active', 'suspended', 'st', 'star_st',
+            'delisting_period', 'delisted', 'terminated', 'unknown'
+        )
+    )
 );
 
 CREATE INDEX IF NOT EXISTS idx_security_master_symbol
@@ -114,7 +119,10 @@ CREATE TABLE IF NOT EXISTS qmeta.security_identifier_history (
     identifier_type     VARCHAR(32) NOT NULL DEFAULT 'trade_symbol',
     start_date          DATE NOT NULL,
     end_date            DATE,
+    announce_time       TIMESTAMPTZ NOT NULL,
+    ingest_time         TIMESTAMPTZ NOT NULL DEFAULT now(),
     source_id           BIGINT REFERENCES qmeta.source_system(source_id),
+    batch_id            BIGINT NOT NULL REFERENCES qmeta.data_batch(batch_id),
     revision_id         BIGINT NOT NULL DEFAULT 1,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (security_id, identifier_type, symbol, start_date, revision_id),
@@ -129,7 +137,10 @@ CREATE TABLE IF NOT EXISTS qmeta.security_name_history (
     name                VARCHAR(128) NOT NULL,
     start_date          DATE NOT NULL,
     end_date            DATE,
+    announce_time       TIMESTAMPTZ NOT NULL,
+    ingest_time         TIMESTAMPTZ NOT NULL DEFAULT now(),
     source_id           BIGINT REFERENCES qmeta.source_system(source_id),
+    batch_id            BIGINT NOT NULL REFERENCES qmeta.data_batch(batch_id),
     revision_id         BIGINT NOT NULL DEFAULT 1,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (security_id, start_date, revision_id),
@@ -142,7 +153,10 @@ CREATE TABLE IF NOT EXISTS qmeta.security_status_history (
     start_date          DATE NOT NULL,
     end_date            DATE,
     reason              TEXT,
+    announce_time       TIMESTAMPTZ NOT NULL,
+    ingest_time         TIMESTAMPTZ NOT NULL DEFAULT now(),
     source_id           BIGINT REFERENCES qmeta.source_system(source_id),
+    batch_id            BIGINT NOT NULL REFERENCES qmeta.data_batch(batch_id),
     revision_id         BIGINT NOT NULL DEFAULT 1,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (security_id, status, start_date, revision_id),
@@ -378,6 +392,30 @@ CREATE TABLE IF NOT EXISTS qmeta.industry_category (
     UNIQUE (industry_system_id, industry_code, level)
 );
 
+CREATE TABLE IF NOT EXISTS qmeta.industry_category_history (
+    industry_id         BIGINT NOT NULL REFERENCES qmeta.industry_category(industry_id),
+    industry_system_id  BIGINT NOT NULL REFERENCES qmeta.industry_system(industry_system_id),
+    industry_code       VARCHAR(64) NOT NULL,
+    industry_name       VARCHAR(128) NOT NULL,
+    level               SMALLINT NOT NULL,
+    parent_industry_id  BIGINT REFERENCES qmeta.industry_category(industry_id),
+    start_date          DATE NOT NULL,
+    end_date            DATE,
+    announce_time       TIMESTAMPTZ NOT NULL,
+    ingest_time         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    source_id           BIGINT REFERENCES qmeta.source_system(source_id),
+    batch_id            BIGINT NOT NULL REFERENCES qmeta.data_batch(batch_id),
+    revision_id         BIGINT NOT NULL DEFAULT 1,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (industry_id, start_date, revision_id),
+    CHECK (end_date IS NULL OR end_date >= start_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_industry_category_history_asof
+    ON qmeta.industry_category_history(
+        industry_system_id, level, start_date, ingest_time, batch_id
+    );
+
 CREATE TABLE IF NOT EXISTS qpit.industry_membership_pit (
     security_id         BIGINT NOT NULL REFERENCES qmeta.security_master(security_id),
     industry_system_id  BIGINT NOT NULL REFERENCES qmeta.industry_system(industry_system_id),
@@ -407,6 +445,18 @@ CREATE TABLE IF NOT EXISTS qmeta.universe_definition (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (universe_type IN ('index', 'rule_based', 'manual', 'strategy'))
 );
+
+CREATE TABLE IF NOT EXISTS qmeta.universe_snapshot (
+    snapshot_id         BIGSERIAL PRIMARY KEY,
+    universe_id         BIGINT NOT NULL REFERENCES qmeta.universe_definition(universe_id),
+    trade_date          DATE NOT NULL,
+    batch_id            BIGINT NOT NULL REFERENCES qmeta.data_batch(batch_id),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (universe_id, trade_date, batch_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_universe_snapshot_selection
+    ON qmeta.universe_snapshot(universe_id, trade_date, batch_id DESC);
 
 CREATE TABLE IF NOT EXISTS qpit.universe_member_pit (
     universe_id         BIGINT NOT NULL REFERENCES qmeta.universe_definition(universe_id),

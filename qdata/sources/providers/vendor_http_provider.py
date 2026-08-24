@@ -303,12 +303,12 @@ def _securities_from_rows(rows: list[dict[str, Any]], symbols: list[str] | None)
             currency=str(row.get("currency") or "CNY"),
             list_date=row.get("list_date") or None,
             delist_date=row.get("delist_date") or None,
-            status=str(row.get("status") or "active"),
+            status=str(row["status"]) if row.get("status") else None,
         )
     for symbol in symbols or []:
         by_symbol.setdefault(
             symbol,
-            SecurityRecord(symbol=symbol, name=symbol, asset_type="stock", currency="CNY", status="active"),
+            SecurityRecord(symbol=symbol, name=symbol, asset_type="stock", currency="CNY"),
         )
     return list(by_symbol.values())
 

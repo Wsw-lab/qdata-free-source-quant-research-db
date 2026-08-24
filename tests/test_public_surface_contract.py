@@ -249,6 +249,37 @@ class PublicSurfaceContractTest(unittest.TestCase):
         payload = json.loads(notebook_path.read_text(encoding="utf-8"))
         self.assertEqual(payload["nbformat"], 4)
 
+    def test_public_contract_states_latest_only_factor_boundary_and_snapshot_formula(self) -> None:
+        surfaces = {
+            README_ZH: README_ZH.read_text(encoding="utf-8"),
+            README_EN: README_EN.read_text(encoding="utf-8"),
+            NOTEBOOK: NOTEBOOK.read_text(encoding="utf-8"),
+            ROOT / "docs" / "index.html": (
+                ROOT / "docs" / "index.html"
+            ).read_text(encoding="utf-8"),
+        }
+        for path, text in surfaces.items():
+            with self.subTest(path=path.relative_to(ROOT)):
+                self.assertIn("latest", text)
+                self.assertNotIn("Pull point-in-time factor values", text)
+
+        for path in (README_ZH, README_EN):
+            with self.subTest(snapshot_formula=path.relative_to(ROOT)):
+                self.assertIn(
+                    "close_adjusted = close_raw * adjustment_factor",
+                    surfaces[path],
+                )
+
+        api_contract = (ROOT / "api-contract.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "| `query_mode` | string | 否 | `latest` | 当前只支持 `latest`",
+            api_contract,
+        )
+        self.assertNotIn(
+            "| `query_mode` | string | 否 | `asof` | 默认 asof |",
+            api_contract,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

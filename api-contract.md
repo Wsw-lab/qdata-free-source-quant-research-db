@@ -1846,6 +1846,8 @@ POST /v1/market/trading-constraints
 - `list_days`
 - `is_delisting_period`
 
+选择规则：涨跌停与停牌 episode 分别按 natural key 先应用成功批次和逐日 knowledge cutoff，再选择确定性最新 revision；二者的日期并集构成返回 spine，因此 suspension-only 记录不会因缺少涨跌停行而消失。带过滤条件的股票池若缺少约束证据会 fail closed。
+
 响应示例：
 
 ```json
@@ -1948,6 +1950,8 @@ POST /v1/index/members/asof
 | `index_code` | string | 指数代码 |
 | `symbol` | string | 成分股代码 |
 | `effective_date` | string | 生效日期 |
+
+行业归属和行业代码/名称均来自带 `batch_id`、`announce_time`、`ingest_time` 与 `revision_id` 的历史行；选择器先限制成功批次和 `asof_date` knowledge cutoff，再按请求 level 选择确定性 revision，不读取 current category label。
 | `end_date` | string | 结束日期 |
 | `weight` | number | 权重 |
 
@@ -2032,7 +2036,7 @@ POST /v1/factors/values
 | `start_date` | string | 是 | 无 | 开始日期 |
 | `end_date` | string | 是 | 无 | 结束日期 |
 | `factor_version` | string | 否 | `published` | 因子版本 |
-| `query_mode` | string | 否 | `asof` | 默认 asof |
+| `query_mode` | string | 否 | `latest` | 当前只支持 `latest`；`asof`/`vintage` fail closed |
 | `format` | string | 否 | `long` | `long` 或 `wide` |
 
 请求示例：
@@ -2043,7 +2047,7 @@ POST /v1/factors/values
   "universe": "zz800",
   "start_date": "2024-01-01",
   "end_date": "2024-12-31",
-  "query_mode": "asof",
+  "query_mode": "latest",
   "format": "long"
 }
 ```
@@ -2242,10 +2246,15 @@ factors = client.get_factor(
     universe="zz800",
     start_date="2024-01-01",
     end_date="2024-12-31",
-    query_mode="asof",
+    query_mode="latest",
     format="long"
 )
 ```
+
+当前公开 `get_factor` 与 `get_adjustment_factor` 签名不能完整表达 knowledge
+cutoff 或固定数据版本，因此只支持 `query_mode="latest"`；传入 `asof` 或
+`vintage` 会 fail closed。`start_date`/`end_date` 只过滤经济日期，不是 PIT
+可见性边界。价格接口仍可按其完整参数使用下表三种模式。
 
 ### 6.11 `get_dataset_health`
 

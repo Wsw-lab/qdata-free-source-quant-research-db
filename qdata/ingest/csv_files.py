@@ -25,6 +25,18 @@ def read_security_master(path: str | Path) -> list[SecurityRecord]:
         symbol = _normalize_symbol(row["symbol"])
         list_date = _optional_date(row.get("list_date"), "list_date")
         delist_date = _optional_date(row.get("delist_date"), "delist_date")
+        status_effective_date = _optional_date(
+            row.get("status_effective_date"),
+            "status_effective_date",
+        )
+        identifier_effective_date = _optional_date(
+            row.get("identifier_effective_date"),
+            "identifier_effective_date",
+        )
+        name_effective_date = _optional_date(
+            row.get("name_effective_date"),
+            "name_effective_date",
+        )
         records.append(
             SecurityRecord(
                 symbol=symbol,
@@ -33,7 +45,15 @@ def read_security_master(path: str | Path) -> list[SecurityRecord]:
                 currency=(row.get("currency") or "CNY").strip(),
                 list_date=list_date,
                 delist_date=delist_date,
-                status=(row.get("status") or "active").strip(),
+                status=(row.get("status") or "").strip() or None,
+                status_effective_date=status_effective_date,
+                security_id=(
+                    int(row["security_id"])
+                    if row.get("security_id") not in (None, "")
+                    else None
+                ),
+                identifier_effective_date=identifier_effective_date,
+                name_effective_date=name_effective_date,
             )
         )
     return records

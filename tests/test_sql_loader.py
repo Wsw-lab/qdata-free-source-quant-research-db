@@ -10,6 +10,7 @@ from qdata.ingest.models import (
     LimitPriceRecord,
     MinuteBarRecord,
     QualityReport,
+    SecurityRecord,
     SuspensionRecord,
     TradableUniverseRecord,
 )
@@ -29,6 +30,11 @@ class StatefulConnection:
         self.version_status = {}
         self.version_batch = {}
         self.adjustment_revisions = {}
+        self.security_master_row = None
+        self.security_identifier_row = None
+        self.security_name_row = None
+        self.security_status_row = None
+        self.universe_definition_type = "rule_based"
         self.fail_commit_numbers = set()
         self.fail_sql_token = None
         self.rollback_error = None
@@ -56,6 +62,10 @@ class StatefulConnection:
                 self.version_status,
                 self.version_batch,
                 self.adjustment_revisions,
+                self.security_identifier_row,
+                self.security_name_row,
+                self.security_status_row,
+                self.universe_definition_type,
             )
         )
 
@@ -65,6 +75,10 @@ class StatefulConnection:
             self.version_status,
             self.version_batch,
             self.adjustment_revisions,
+            self.security_identifier_row,
+            self.security_name_row,
+            self.security_status_row,
+            self.universe_definition_type,
         ) = copy.deepcopy(state)
 
 
@@ -102,6 +116,29 @@ class StatefulCursor:
             self.connection.version_batch[data_version] = batch_id
             self._one = {"data_version": data_version, "version_code": params[1]}
             self.rowcount = 1
+        elif normalized.startswith("insert into qmeta.security_master"):
+            self._one = self.connection.security_master_row or {
+                "security_id": 1000001,
+                "list_date": params.get("list_date"),
+                "delist_date": params.get("delist_date"),
+                "current_name": params.get("current_name"),
+                "current_status": params.get("current_status") or "unknown",
+            }
+            self.rowcount = 1
+        elif normalized.startswith("select st.status, st.start_date, st.end_date") \
+                and "from qmeta.security_status_history" in normalized:
+            self._one = self.connection.security_status_row
+            self.rowcount = int(self._one is not None)
+        elif normalized.startswith(
+                "select sih.symbol, sih.exchange, sih.start_date, sih.end_date"
+        ) \
+                and "from qmeta.security_identifier_history" in normalized:
+            self._one = self.connection.security_identifier_row
+            self.rowcount = int(self._one is not None)
+        elif normalized.startswith("select snh.name, snh.start_date, snh.end_date") \
+                and "from qmeta.security_name_history" in normalized:
+            self._one = self.connection.security_name_row
+            self.rowcount = int(self._one is not None)
         elif normalized.startswith("update qmeta.data_batch"):
             status, _, _, batch_id = params
             guarded = "status = 'running'" in normalized
@@ -142,8 +179,10 @@ class StatefulCursor:
             existing.append((revision_id, params[2], params[3]))
             self.rowcount = 1
         elif normalized.startswith("insert into qmeta.universe_definition"):
-            self._one = {"universe_id": 501}
-            self.rowcount = 1
+            guarded = "universe_type = 'rule_based'" in normalized
+            if not guarded or self.connection.universe_definition_type == "rule_based":
+                self._one = {"universe_id": 501}
+                self.rowcount = 1
         else:
             self.rowcount = 1
 
@@ -168,6 +207,258 @@ class FakeClickHouse:
 
 
 class SqlDailyBundleLoaderTest(unittest.TestCase):
+    def test_security_record_does_not_invent_an_active_status(self) -> None:
+        self.assertIsNone(SecurityRecord("600519.SH", "600519.SH").status)
+
+    def test_new_placeholder_security_has_no_pit_history_until_authoritative(self) -> None:
+        connection = StatefulConnection()
+        loader = self._loader(connection, FakeClickHouse())
+        loader._create_batch = lambda *args: 91
+        loader._finish_batches = lambda *args, **kwargs: None
+
+        loader.load_security_master([SecurityRecord("600519.SH", "600519.SH")])
+
+        history_inserts = [
+            sql
+            for sql, _ in connection.executed
+            if any(
+                f"INSERT INTO {table}" in sql
+                for table in (
+                    "qmeta.security_identifier_history",
+                    "qmeta.security_name_history",
+                    "qmeta.security_status_history",
+                )
+            )
+        ]
+        self.assertEqual(history_inserts, [])
+
+    def test_placeholder_security_preserves_master_without_inventing_history(self) -> None:
+        connection = StatefulConnection()
+        connection.security_master_row = {
+            "security_id": 1000001,
+            "list_date": "2001-08-27",
+            "delist_date": None,
+            "current_name": "Authoritative Name",
+            "current_status": "active",
+        }
+        loader = self._loader(connection, FakeClickHouse())
+        loader._create_batch = lambda *args: 91
+        loader._finish_batches = lambda *args, **kwargs: None
+
+        loader.load_security_master([SecurityRecord("600519.SH", "600519.SH")])
+
+        master_sql = next(
+            sql
+            for sql, _ in connection.executed
+            if "INSERT INTO qmeta.security_master" in sql
+        )
+        self.assertIn("COALESCE(%(current_status)s, 'unknown')", master_sql)
+
+        self.assertFalse(
+            any("_history" in sql and "INSERT INTO" in sql for sql, _ in connection.executed)
+        )
+
+    def test_security_status_recovery_closes_prior_episode_append_only(self) -> None:
+        connection = StatefulConnection()
+        connection.security_master_row = {
+            "security_id": 1000001,
+            "list_date": "2001-08-27",
+            "delist_date": None,
+            "current_name": "Recovered Corp",
+            "current_status": "active",
+        }
+        connection.security_status_row = {
+            "status": "suspended",
+            "start_date": "2024-02-01",
+            "end_date": None,
+        }
+        loader = self._loader(connection, FakeClickHouse())
+        loader._create_batch = lambda *args: 91
+        loader._finish_batches = lambda *args, **kwargs: None
+
+        loader.load_security_master(
+            [
+                SecurityRecord(
+                    "600519.SH",
+                    "Recovered Corp",
+                    list_date="2001-08-27",
+                    status="active",
+                    status_effective_date="2024-02-05",
+                )
+            ]
+        )
+
+        status_params = [
+            params
+            for sql, params in connection.executed
+            if "INSERT INTO qmeta.security_status_history" in sql
+        ]
+        self.assertEqual(len(status_params), 2)
+        self.assertEqual(
+            status_params[0][1:4],
+            ("suspended", "2024-02-01", "2024-02-04"),
+        )
+        self.assertEqual(
+            status_params[1][1:4],
+            ("active", "2024-02-05", None),
+        )
+
+    def test_stable_security_id_closes_old_ticker_and_name_on_rename(self) -> None:
+        connection = StatefulConnection()
+        connection.security_master_row = {
+            "security_id": 1000001,
+            "list_date": "2020-01-01",
+            "delist_date": None,
+            "current_name": "New Name",
+            "current_status": "active",
+        }
+        connection.security_identifier_row = {
+            "symbol": "OLD001",
+            "exchange": "SH",
+            "start_date": "2020-01-01",
+            "end_date": None,
+        }
+        connection.security_name_row = {
+            "name": "Old Name",
+            "start_date": "2020-01-01",
+            "end_date": None,
+        }
+        connection.security_status_row = {
+            "status": "active",
+            "start_date": "2020-01-01",
+            "end_date": None,
+        }
+        loader = self._loader(connection, FakeClickHouse())
+        loader._create_batch = lambda *args: 91
+        loader._finish_batches = lambda *args, **kwargs: None
+
+        loader.load_security_master(
+            [
+                SecurityRecord(
+                    "NEW001.SH",
+                    "New Name",
+                    list_date="2020-01-01",
+                    status="active",
+                    security_id=1000001,
+                    identifier_effective_date="2024-02-05",
+                    name_effective_date="2024-02-05",
+                )
+            ]
+        )
+
+        master_sql, master_params = next(
+            (sql, params)
+            for sql, params in connection.executed
+            if "INSERT INTO qmeta.security_master" in sql
+        )
+        self.assertIn("ON CONFLICT (security_id)", master_sql)
+        self.assertEqual(master_params["security_id"], 1000001)
+        identifier_params = [
+            params
+            for sql, params in connection.executed
+            if "INSERT INTO qmeta.security_identifier_history" in sql
+        ]
+        self.assertEqual(
+            identifier_params[0][1:5],
+            ("OLD001", "SH", "2020-01-01", "2024-02-04"),
+        )
+        self.assertEqual(
+            identifier_params[1][1:5],
+            ("NEW001", "SH", "2024-02-05", None),
+        )
+        name_params = [
+            params
+            for sql, params in connection.executed
+            if "INSERT INTO qmeta.security_name_history" in sql
+        ]
+        self.assertEqual(
+            name_params[0][1:4],
+            ("Old Name", "2020-01-01", "2024-02-04"),
+        )
+        self.assertEqual(
+            name_params[1][1:4],
+            ("New Name", "2024-02-05", None),
+        )
+
+    def test_tradable_snapshot_rejects_existing_non_rule_based_definition(self) -> None:
+        connection = StatefulConnection()
+        connection.universe_definition_type = "manual"
+        loader = self._loader(connection, FakeClickHouse())
+
+        with self.assertRaisesRegex(
+            QDataValidationError,
+            "existing universe is not rule_based",
+        ):
+            loader.load_tradable_universe(
+                "shared_code",
+                "Rule snapshot",
+                "2024-01-02",
+                [],
+            )
+
+    def test_delisted_security_history_has_active_then_delisted_intervals(self) -> None:
+        connection = StatefulConnection()
+        connection.security_master_row = {
+            "security_id": 1000001,
+            "list_date": "2001-08-27",
+            "delist_date": "2024-12-31",
+            "current_name": "Delisted Corp",
+            "current_status": "delisted",
+        }
+        loader = self._loader(connection, FakeClickHouse())
+        loader._create_batch = lambda *args: 91
+        loader._finish_batches = lambda *args, **kwargs: None
+
+        loader.load_security_master(
+            [
+                SecurityRecord(
+                    "600519.SH",
+                    "Delisted Corp",
+                    list_date="2001-08-27",
+                    delist_date="2024-12-31",
+                    status="delisted",
+                )
+            ]
+        )
+
+        status_params = [
+            params
+            for sql, params in connection.executed
+            if "INSERT INTO qmeta.security_status_history" in sql
+        ]
+        self.assertEqual(len(status_params), 2)
+        self.assertEqual(status_params[0][1:4], ("active", "2001-08-27", "2024-12-30"))
+        self.assertEqual(status_params[1][1:4], ("delisted", "2024-12-31", None))
+
+    def test_security_history_rows_are_batch_bound_append_only_revisions(self) -> None:
+        connection = StatefulConnection()
+        loader = self._loader(connection, FakeClickHouse())
+        terminal = []
+        loader._create_batch = lambda *args: 91
+        loader._finish_batches = lambda batch_ids, status, error_message=None: terminal.append(
+            (tuple(batch_ids), status)
+        )
+
+        loader.load_security_master(
+            [SecurityRecord("600519.SH", "Guizhou Moutai", list_date="2001-08-27")]
+        )
+
+        for table in (
+            "qmeta.security_identifier_history",
+            "qmeta.security_name_history",
+            "qmeta.security_status_history",
+        ):
+            inserts = [
+                sql for sql, _ in connection.executed if f"INSERT INTO {table}" in sql
+            ]
+            with self.subTest(table=table):
+                self.assertEqual(len(inserts), 1)
+                self.assertIn("announce_time", inserts[0])
+                self.assertIn("ingest_time", inserts[0])
+                self.assertIn("batch_id", inserts[0])
+                self.assertNotIn("ON CONFLICT", inserts[0])
+        self.assertEqual(terminal, [((91,), "success")])
+
     def test_create_versioned_batch_creates_distinct_draft_version(self) -> None:
         connection = StatefulConnection()
         loader = self._loader(connection, FakeClickHouse())
@@ -348,6 +639,48 @@ class SqlDailyBundleLoaderTest(unittest.TestCase):
         self.assertIn("INSERT INTO qmeta.suspension_history", sql_text)
         self.assertEqual(terminal, [((91, 92, 93), "success")])
 
+    def test_limit_and_suspension_corrections_allocate_append_only_revisions(self) -> None:
+        connection = StatefulConnection()
+        loader = self._loader(connection, FakeClickHouse())
+        ids = iter([91, 92, 93, 94])
+        loader._create_batch = lambda *args: next(ids)
+        loader._finish_batches = lambda *args, **kwargs: None
+
+        for limit_up, suspension_end in (
+            (100.0, "2024-01-04 15:00:00"),
+            (101.0, "2024-01-04 14:30:00"),
+        ):
+            loader.load_market_constraints(
+                [],
+                [LimitPriceRecord("600519.SH", "2024-01-04", limit_up, 80.0)],
+                [
+                    SuspensionRecord(
+                        "600519.SH",
+                        "2024-01-04 09:30:00",
+                        suspension_end,
+                        "full_day",
+                        "correction",
+                    )
+                ],
+            )
+
+        sql_text = "\n".join(sql for sql, _ in connection.executed)
+        lock_keys = [
+            params[0]
+            for sql, params in connection.executed
+            if "pg_advisory_xact_lock" in sql
+        ]
+        self.assertTrue(any(str(key).startswith("qmeta.limit_price_daily:") for key in lock_keys))
+        self.assertTrue(any(str(key).startswith("qmeta.suspension_history:") for key in lock_keys))
+        self.assertGreaterEqual(sql_text.count("COALESCE(MAX(revision_id), 0) + 1"), 4)
+        for table in ("qmeta.limit_price_daily", "qmeta.suspension_history"):
+            insert_sql = "\n".join(
+                sql
+                for sql, _ in connection.executed
+                if f"INSERT INTO {table}" in sql
+            )
+            self.assertNotIn("ON CONFLICT", insert_sql)
+
     def test_universe_failure_marks_started_batch_failed(self) -> None:
         connection = StatefulConnection()
         connection.fail_sql_token = "insert into qpit.universe_member_pit"
@@ -368,6 +701,65 @@ class SqlDailyBundleLoaderTest(unittest.TestCase):
 
         self.assertEqual(terminal[-1][0:2], ((93,), "failed"))
         self.assertEqual(connection.rollback_count, 1)
+
+    def test_tradable_universe_is_a_daily_snapshot_with_append_only_reruns(self) -> None:
+        connection = StatefulConnection()
+        loader = self._loader(connection, FakeClickHouse())
+        loader._security_id_map = lambda symbols: {
+            "600519.SH": 1000001,
+            "000001.SZ": 1000002,
+        }
+        terminal = []
+        ids = iter([91, 92, 93, 94])
+        loader._create_batch = lambda *args: next(ids)
+        loader._finish_batches = lambda batch_ids, status, error_message=None: terminal.append(
+            (tuple(batch_ids), status)
+        )
+
+        loader.load_tradable_universe(
+            "cn_a", "A shares", "2024-01-02",
+            [
+                TradableUniverseRecord("600519.SH", "2024-01-02"),
+                TradableUniverseRecord("000001.SZ", "2024-01-02"),
+            ],
+        )
+        loader.load_tradable_universe(
+            "cn_a", "A shares", "2024-01-03",
+            [TradableUniverseRecord("000001.SZ", "2024-01-03")],
+        )
+        loader.load_tradable_universe("cn_a", "A shares", "2024-01-04", [])
+        loader.load_tradable_universe(
+            "cn_a", "A shares", "2024-01-03",
+            [TradableUniverseRecord("000001.SZ", "2024-01-03", 0.75)],
+        )
+
+        inserts = [
+            (sql, params)
+            for sql, params in connection.executed
+            if "INSERT INTO qpit.universe_member_pit" in sql
+        ]
+        self.assertEqual(len(inserts), 4)
+        snapshot_markers = [
+            params
+            for sql, params in connection.executed
+            if "INSERT INTO qmeta.universe_snapshot" in sql
+        ]
+        self.assertEqual(len(snapshot_markers), 4)
+        self.assertEqual([params[1] for params in snapshot_markers], [
+            "2024-01-02", "2024-01-03", "2024-01-04", "2024-01-03"
+        ])
+        for sql, _ in inserts:
+            self.assertNotIn("ON CONFLICT", sql)
+            self.assertIn("effective_date, end_date", sql)
+        sql_text = "\n".join(sql for sql, _ in connection.executed)
+        lock_keys = [
+            params[0]
+            for sql, params in connection.executed
+            if "pg_advisory_xact_lock" in sql
+        ]
+        self.assertTrue(any(str(key).startswith("qpit.universe_member_pit:") for key in lock_keys))
+        self.assertGreaterEqual(sql_text.count("COALESCE(MAX(revision_id), 0) + 1"), 4)
+        self.assertEqual(terminal[-2:], [((93,), "success"), ((94,), "success")])
 
     def test_quality_failure_marks_started_batch_failed(self) -> None:
         connection = StatefulConnection()

@@ -11,6 +11,9 @@ ROOT = Path(__file__).resolve().parents[1]
 INIT_DDL = ROOT / "db" / "migrations" / "0002_clickhouse_init.sql"
 COMBINED_DDL = ROOT / "db" / "table.sql"
 VINTAGE_MIGRATION = ROOT / "db" / "migrations" / "0056_clickhouse_durable_vintage.sql"
+FACTOR_VINTAGE_MIGRATION = (
+    ROOT / "db" / "migrations" / "0057_clickhouse_factor_durable_vintage.sql"
+)
 
 
 def _table_block(sql: str, table: str) -> str:
@@ -66,6 +69,61 @@ def _merged_rows(rows: list[dict], key: tuple[str, ...]) -> list[dict]:
 
 
 class ClickHouseVintageSchemaContractTest(unittest.TestCase):
+    def test_fresh_factor_schema_retains_each_data_version_after_merge(self) -> None:
+        rows = [
+            {
+                "factor_id": 1,
+                "factor_version_id": 11,
+                "security_id": 101,
+                "trade_date": "2024-01-02",
+                "data_version": 7001,
+                "ingest_time": "2024-01-02T17:00:00",
+                "factor_value": 0.1,
+            },
+            {
+                "factor_id": 1,
+                "factor_version_id": 11,
+                "security_id": 101,
+                "trade_date": "2024-01-02",
+                "data_version": 7002,
+                "ingest_time": "2024-01-02T18:00:00",
+                "factor_value": 0.2,
+            },
+        ]
+        for ddl_path in (INIT_DDL, COMBINED_DDL):
+            with self.subTest(ddl=ddl_path.name):
+                key = _order_key(
+                    _table_block(
+                        ddl_path.read_text(encoding="utf-8"),
+                        "qts.factor_value_daily",
+                    )
+                )
+                merged = _merged_rows(rows, key)
+                self.assertEqual(
+                    sorted(row["data_version"] for row in merged),
+                    [7001, 7002],
+                )
+
+    def test_existing_factor_table_has_forward_only_vintage_migration(self) -> None:
+        self.assertTrue(
+            FACTOR_VINTAGE_MIGRATION.is_file(),
+            "a forward-only factor sorting-key migration is required",
+        )
+        sql = FACTOR_VINTAGE_MIGRATION.read_text(encoding="utf-8")
+        required = (
+            "SYSTEM STOP MERGES qts.factor_value_daily;",
+            "CREATE TABLE qts.factor_value_daily__0057_rebuild",
+            "ORDER BY (factor_id, trade_date, security_id, factor_version_id, data_version)",
+            "INSERT INTO qts.factor_value_daily__0057_rebuild",
+            "FROM qts.factor_value_daily",
+            "EXCHANGE TABLES qts.factor_value_daily AND qts.factor_value_daily__0057_rebuild;",
+            "SYSTEM STOP MERGES qts.factor_value_daily__0057_rebuild;",
+            "SYSTEM START MERGES qts.factor_value_daily;",
+        )
+        for statement in required:
+            with self.subTest(statement=statement):
+                self.assertIn(statement, sql)
+
     def test_migration_freezes_both_sources_before_any_rebuild_work(self) -> None:
         sql = VINTAGE_MIGRATION.read_text(encoding="utf-8")
         stop_statements = [
@@ -168,6 +226,119 @@ class ClickHouseVintageSchemaContractTest(unittest.TestCase):
     "set QDATA_RUN_CLICKHOUSE_INTEGRATION=1 to run ClickHouse 24.8 migration test",
 )
 class ClickHouseVintageMigrationIntegrationTest(unittest.TestCase):
+    def test_factor_optimize_final_retains_vintages_and_replaces_only_retries(self) -> None:
+        try:
+            import clickhouse_connect
+        except ImportError as exc:
+            self.fail(f"clickhouse-connect is required: {exc}")
+
+        dsn = os.getenv(
+            "QDATA_CLICKHOUSE_DSN",
+            "http://qdata:qdata@127.0.0.1:18123/default",
+        )
+        client = clickhouse_connect.get_client(dsn=dsn)
+        shanghai = ZoneInfo("Asia/Shanghai")
+        trade_day = date(2024, 1, 2)
+        table = f"qdata_factor_vintage_{uuid4().hex[:10]}"
+        qualified = f"default.{table}"
+        fixture_qualified = f"{qualified}__fixture_source"
+        rebuild_qualified = f"{qualified}__0057_rebuild"
+        cleanup = [qualified, fixture_qualified, rebuild_qualified]
+        try:
+            source_ddl = _table_block(
+                INIT_DDL.read_text(encoding="utf-8"),
+                "qts.factor_value_daily",
+            )
+            old_key_ddl = source_ddl.replace(
+                "CREATE TABLE IF NOT EXISTS qts.factor_value_daily",
+                f"CREATE TABLE {qualified}",
+                1,
+            ).replace(
+                "ORDER BY (factor_id, trade_date, security_id, factor_version_id, data_version)",
+                "ORDER BY (factor_id, trade_date, security_id, factor_version_id)",
+                1,
+            )
+            client.command(old_key_ddl.rstrip(";"))
+            fixture_ddl = old_key_ddl.replace(
+                f"CREATE TABLE {qualified}",
+                f"CREATE TABLE {fixture_qualified}",
+                1,
+            ).replace(
+                "ENGINE = ReplacingMergeTree(calc_time)",
+                "ENGINE = MergeTree",
+                1,
+            )
+            client.command(fixture_ddl.rstrip(";"))
+            columns = [
+                "factor_id",
+                "factor_version_id",
+                "security_id",
+                "trade_date",
+                "factor_value",
+                "data_version",
+                "calc_time",
+            ]
+            rows = [
+                [1, 11, 101, trade_day, 0.20, 7002,
+                 datetime(2024, 1, 2, 18, 0, tzinfo=shanghai)],
+                [1, 11, 101, trade_day, 0.10, 7001,
+                 datetime(2024, 1, 2, 17, 0, tzinfo=shanghai)],
+                [1, 11, 101, trade_day, 0.19, 7002,
+                 datetime(2024, 1, 2, 17, 59, tzinfo=shanghai)],
+                [1, 11, 101, trade_day, 0.11, 7001,
+                 datetime(2024, 1, 2, 17, 1, tzinfo=shanghai)],
+            ]
+            client.insert(fixture_qualified, rows, column_names=columns)
+            client.command(
+                f"ALTER TABLE {qualified} ATTACH PARTITION 202401 "
+                f"FROM {fixture_qualified}"
+            )
+
+            rendered = FACTOR_VINTAGE_MIGRATION.read_text(encoding="utf-8").replace(
+                "qts.factor_value_daily",
+                qualified,
+            )
+            executable_sql = "\n".join(
+                line for line in rendered.splitlines()
+                if not line.lstrip().startswith("--")
+            )
+            for statement in executable_sql.split(";"):
+                if statement.strip():
+                    client.command(statement)
+
+            sorting_key = client.query(
+                f"""
+                SELECT sorting_key FROM system.tables
+                WHERE database = 'default' AND name = '{table}'
+                """
+            ).result_rows
+            self.assertEqual(
+                sorting_key,
+                [(
+                    "factor_id, trade_date, security_id, factor_version_id, data_version",
+                )],
+            )
+            client.insert(
+                qualified,
+                [[2, 11, 101, trade_day, 9.9, 9999,
+                  datetime(2024, 1, 2, 19, 0, tzinfo=shanghai)]],
+                column_names=columns,
+            )
+            client.command(f"OPTIMIZE TABLE {qualified} FINAL")
+            retained = client.query(
+                f"""
+                SELECT data_version, factor_value
+                FROM {qualified}
+                WHERE factor_id = 1 AND security_id = 101
+                ORDER BY data_version
+                """
+            ).result_rows
+            self.assertEqual(retained, [(7001, 0.11), (7002, 0.2)])
+        finally:
+            for target in cleanup:
+                client.command(f"DROP TABLE IF EXISTS {target} SYNC")
+            client.close()
+
     def test_daily_and_minute_optimize_final_retain_vintages_and_retries(self) -> None:
         try:
             import clickhouse_connect

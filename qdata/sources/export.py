@@ -61,7 +61,19 @@ def _write_security_master(path: Path, bundle: DailyMarketBundle) -> None:
     with path.open("w", encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(
             file,
-            fieldnames=["symbol", "name", "asset_type", "currency", "list_date", "delist_date", "status"],
+            fieldnames=[
+                "symbol",
+                "name",
+                "asset_type",
+                "currency",
+                "list_date",
+                "delist_date",
+                "status",
+                "status_effective_date",
+                "security_id",
+                "identifier_effective_date",
+                "name_effective_date",
+            ],
         )
         writer.writeheader()
         for record in bundle.securities:
@@ -73,7 +85,11 @@ def _write_security_master(path: Path, bundle: DailyMarketBundle) -> None:
                     "currency": record.currency,
                     "list_date": record.list_date or "",
                     "delist_date": record.delist_date or "",
-                    "status": record.status,
+                    "status": record.status or "",
+                    "status_effective_date": record.status_effective_date or "",
+                    "security_id": record.security_id or "",
+                    "identifier_effective_date": record.identifier_effective_date or "",
+                    "name_effective_date": record.name_effective_date or "",
                 }
             )
 

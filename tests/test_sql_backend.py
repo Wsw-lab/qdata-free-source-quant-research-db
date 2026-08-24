@@ -165,7 +165,13 @@ class FakePostgres:
                         and item["effective_time"] > cutoff):
                     continue
             rows.append(dict(item))
-        if "DISTINCT ON (security_id, trade_date)" not in sql:
+        if not any(
+            marker in sql
+            for marker in (
+                "DISTINCT ON (security_id, trade_date)",
+                "DISTINCT ON (af.security_id, af.trade_date)",
+            )
+        ):
             return rows
         latest = {}
         for row in rows:
@@ -261,7 +267,10 @@ class SqlBackendTest(unittest.TestCase):
         client = Client(backend="sql", postgres_client=postgres, default_format="records")
         rows = client.get_security_master(symbols=["600519.SH"], asof_date="2024-12-31")
         self.assertEqual(rows[0]["symbol"], "600519.SH")
-        self.assertIn("sm.list_date IS NULL", postgres.queries[-1][0])
+        sql = postgres.queries[-1][0]
+        self.assertNotIn("sm.list_date IS NULL", sql)
+        self.assertIn("identifier.historical_list_date AS list_date", sql)
+        self.assertIn("db_identifier.status = 'success'", sql)
 
     def test_latest_price_excludes_failed_and_running_versions_before_ranking(self) -> None:
         versions = [

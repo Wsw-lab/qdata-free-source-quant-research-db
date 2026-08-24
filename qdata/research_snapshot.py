@@ -907,6 +907,13 @@ def _validate_row_semantics(
             raise SnapshotValidationError(
                 f"daily_bar row {index} adjustment_factor must be positive"
             )
+        adjusted_close = Decimal(row["close_adjusted"])
+        expected_adjusted_close = close * Decimal(row["adjustment_factor"])
+        if abs(adjusted_close - expected_adjusted_close) > Decimal("0.000001"):
+            raise SnapshotValidationError(
+                f"daily_bar row {index} close_adjusted must equal close_raw * "
+                "adjustment_factor within 0.000001"
+            )
         if Decimal(row["volume"]) < 0 or Decimal(row["amount"]) < 0:
             raise SnapshotValidationError(
                 f"daily_bar row {index} volume and amount must be non-negative"

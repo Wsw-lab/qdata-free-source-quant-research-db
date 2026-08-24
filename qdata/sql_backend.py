@@ -97,10 +97,11 @@ class SqlBackend:
         self._validate_fields(requested_fields, self.SECURITY_FIELDS, "fields")
         where = []
         params: dict[str, Any] = {}
+        normalized_symbols = None
         if symbols:
             symbol_parts = [self._split_symbol(symbol) for symbol in symbols]
-            where.append("(sm.current_symbol || '.' || sm.exchange) = ANY(%(symbols)s)")
-            params["symbols"] = [f"{code}.{exchange}" for code, exchange in symbol_parts]
+            normalized_symbols = [f"{code}.{exchange}" for code, exchange in symbol_parts]
+            params["symbols"] = normalized_symbols
         if security_ids:
             where.append("sm.security_id = ANY(%(security_ids)s)")
             params["security_ids"] = security_ids
@@ -108,31 +109,171 @@ class SqlBackend:
             where.append("sm.asset_type = ANY(%(asset_types)s)")
             params["asset_types"] = asset_types
         if exchanges:
-            where.append("sm.exchange = ANY(%(exchanges)s)")
             params["exchanges"] = exchanges
-        if not include_delisted:
-            where.append("sm.current_status <> 'delisted'")
         if asof_date:
             parse_date(asof_date, "asof_date")
-            where.append("(sm.list_date IS NULL OR sm.list_date <= %(asof_date)s)")
-            where.append("(sm.delist_date IS NULL OR sm.delist_date >= %(asof_date)s)")
             params["asof_date"] = asof_date
-
-        sql = f"""
-            SELECT
-                sm.security_id,
-                sm.current_symbol || '.' || sm.exchange AS symbol,
-                sm.asset_type,
-                sm.exchange,
-                sm.current_name AS name,
-                sm.list_date,
-                sm.delist_date,
-                sm.current_status AS status,
-                sm.currency
-            FROM qmeta.security_master sm
-            {self._where(where)}
-            ORDER BY sm.exchange, sm.current_symbol
-        """
+            if normalized_symbols:
+                where.append("(identifier.symbol || '.' || identifier.exchange) = ANY(%(symbols)s)")
+            if exchanges:
+                where.append("identifier.exchange = ANY(%(exchanges)s)")
+            if not include_delisted:
+                where.append("status_history.status <> 'delisted'")
+            sql = f"""
+                SELECT
+                    sm.security_id,
+                    identifier.symbol || '.' || identifier.exchange AS symbol,
+                    sm.asset_type,
+                    identifier.exchange,
+                    name_history.name,
+                    identifier.historical_list_date AS list_date,
+                    CASE
+                        WHEN status_history.status = 'delisted'
+                        THEN status_history.start_date
+                        ELSE NULL
+                    END AS delist_date,
+                    status_history.status,
+                    sm.currency
+                FROM qmeta.security_master sm
+                JOIN LATERAL (
+                    SELECT identifier_revision.symbol, identifier_revision.exchange,
+                           identifier_revision.historical_list_date
+                    FROM (
+                        SELECT sih.*,
+                            MIN(sih.start_date) OVER (
+                                PARTITION BY sih.security_id
+                            ) AS historical_list_date,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY sih.security_id, sih.identifier_type,
+                                             sih.start_date
+                                ORDER BY sih.revision_id DESC, sih.ingest_time DESC,
+                                         sih.batch_id DESC, sih.symbol DESC
+                            ) AS revision_rank
+                        FROM qmeta.security_identifier_history sih
+                        JOIN qmeta.data_batch db_identifier
+                          ON db_identifier.batch_id = sih.batch_id
+                        JOIN qmeta.dataset_catalog dc_identifier
+                          ON dc_identifier.dataset_id = db_identifier.dataset_id
+                        WHERE sih.security_id = sm.security_id
+                          AND sih.identifier_type = 'trade_symbol'
+                          AND sih.start_date <= %(asof_date)s
+                          AND dc_identifier.dataset_code = 'security_master'
+                          AND db_identifier.status = 'success'
+                          AND db_identifier.finished_at IS NOT NULL
+                          AND db_identifier.finished_at <
+                              (%(asof_date)s::date + INTERVAL '1 day')
+                          AND sih.announce_time <
+                              (%(asof_date)s::date + INTERVAL '1 day')
+                          AND sih.ingest_time <
+                              (%(asof_date)s::date + INTERVAL '1 day')
+                    ) identifier_revision
+                    WHERE identifier_revision.revision_rank = 1
+                      AND (identifier_revision.end_date IS NULL
+                           OR identifier_revision.end_date >= %(asof_date)s)
+                    ORDER BY identifier_revision.start_date DESC,
+                             identifier_revision.revision_id DESC,
+                             identifier_revision.ingest_time DESC,
+                             identifier_revision.batch_id DESC,
+                             identifier_revision.symbol DESC
+                    LIMIT 1
+                ) identifier ON TRUE
+                JOIN LATERAL (
+                    SELECT name_revision.name
+                    FROM (
+                        SELECT snh.*,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY snh.security_id, snh.start_date
+                                ORDER BY snh.revision_id DESC, snh.ingest_time DESC,
+                                         snh.batch_id DESC, snh.name DESC
+                            ) AS revision_rank
+                        FROM qmeta.security_name_history snh
+                        JOIN qmeta.data_batch db_name
+                          ON db_name.batch_id = snh.batch_id
+                        JOIN qmeta.dataset_catalog dc_name
+                          ON dc_name.dataset_id = db_name.dataset_id
+                        WHERE snh.security_id = sm.security_id
+                          AND snh.start_date <= %(asof_date)s
+                          AND dc_name.dataset_code = 'security_master'
+                          AND db_name.status = 'success'
+                          AND db_name.finished_at IS NOT NULL
+                          AND db_name.finished_at <
+                              (%(asof_date)s::date + INTERVAL '1 day')
+                          AND snh.announce_time <
+                              (%(asof_date)s::date + INTERVAL '1 day')
+                          AND snh.ingest_time <
+                              (%(asof_date)s::date + INTERVAL '1 day')
+                    ) name_revision
+                    WHERE name_revision.revision_rank = 1
+                      AND (name_revision.end_date IS NULL
+                           OR name_revision.end_date >= %(asof_date)s)
+                    ORDER BY name_revision.start_date DESC,
+                             name_revision.revision_id DESC,
+                             name_revision.ingest_time DESC,
+                             name_revision.batch_id DESC,
+                             name_revision.name DESC
+                    LIMIT 1
+                ) name_history ON TRUE
+                JOIN LATERAL (
+                    SELECT status_revision.status, status_revision.start_date
+                    FROM (
+                        SELECT ssh.*,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY ssh.security_id, ssh.start_date
+                                ORDER BY ssh.revision_id DESC, ssh.ingest_time DESC,
+                                         ssh.batch_id DESC, ssh.status DESC
+                            ) AS revision_rank
+                        FROM qmeta.security_status_history ssh
+                        JOIN qmeta.data_batch db_status
+                          ON db_status.batch_id = ssh.batch_id
+                        JOIN qmeta.dataset_catalog dc_status
+                          ON dc_status.dataset_id = db_status.dataset_id
+                        WHERE ssh.security_id = sm.security_id
+                          AND ssh.start_date <= %(asof_date)s
+                          AND dc_status.dataset_code = 'security_master'
+                          AND db_status.status = 'success'
+                          AND db_status.finished_at IS NOT NULL
+                          AND db_status.finished_at <
+                              (%(asof_date)s::date + INTERVAL '1 day')
+                          AND ssh.announce_time <
+                              (%(asof_date)s::date + INTERVAL '1 day')
+                          AND ssh.ingest_time <
+                              (%(asof_date)s::date + INTERVAL '1 day')
+                    ) status_revision
+                    WHERE status_revision.revision_rank = 1
+                      AND (status_revision.end_date IS NULL
+                           OR status_revision.end_date >= %(asof_date)s)
+                    ORDER BY status_revision.start_date DESC,
+                             status_revision.revision_id DESC,
+                             status_revision.ingest_time DESC,
+                             status_revision.batch_id DESC,
+                             status_revision.status DESC
+                    LIMIT 1
+                ) status_history ON TRUE
+                {self._where(where)}
+                ORDER BY identifier.exchange, identifier.symbol
+            """
+        else:
+            if normalized_symbols:
+                where.append("(sm.current_symbol || '.' || sm.exchange) = ANY(%(symbols)s)")
+            if exchanges:
+                where.append("sm.exchange = ANY(%(exchanges)s)")
+            if not include_delisted:
+                where.append("sm.current_status <> 'delisted'")
+            sql = f"""
+                SELECT
+                    sm.security_id,
+                    sm.current_symbol || '.' || sm.exchange AS symbol,
+                    sm.asset_type,
+                    sm.exchange,
+                    sm.current_name AS name,
+                    sm.list_date,
+                    sm.delist_date,
+                    sm.current_status AS status,
+                    sm.currency
+                FROM qmeta.security_master sm
+                {self._where(where)}
+                ORDER BY sm.exchange, sm.current_symbol
+            """
         rows = normalize_rows(self.postgres.fetch_all(sql, params))
         return response(project(rows, requested_fields), ["security_master:sql"], "asof" if asof_date else "latest")
 
@@ -272,6 +413,11 @@ class SqlBackend:
         factor_type: str,
         query_mode: str,
     ) -> dict[str, Any]:
+        if query_mode != "latest":
+            raise QDataValidationError(
+                "get_adjustment_factor only supports query_mode='latest'; its public "
+                "signature does not expose a knowledge cutoff or immutable data version"
+            )
         start_date, end_date = ensure_required_dates(start_date, end_date)
         validate_enum(factor_type, {"forward", "backward", "both"}, "factor_type")
         validate_enum(query_mode, {"latest", "asof", "vintage"}, "query_mode")
@@ -282,14 +428,21 @@ class SqlBackend:
             fields.append("factor_forward")
         if factor_type in {"backward", "both"}:
             fields.append("factor_backward")
+        selected_fields = ", ".join(f"af.{field} AS {field}" for field in fields)
 
         rows = self.postgres.fetch_all(
             f"""
-            SELECT DISTINCT ON (security_id, trade_date) {", ".join(fields)}
-            FROM qmeta.adjustment_factor
-            WHERE security_id = ANY(%(security_ids)s)
-              AND trade_date BETWEEN %(start_date)s AND %(end_date)s
-            ORDER BY security_id, trade_date, revision_id DESC, ingest_time DESC
+            SELECT DISTINCT ON (af.security_id, af.trade_date) {selected_fields}
+            FROM qmeta.adjustment_factor af
+            JOIN qmeta.data_batch db ON db.batch_id = af.batch_id
+            JOIN qmeta.dataset_catalog dc ON dc.dataset_id = db.dataset_id
+            WHERE af.security_id = ANY(%(security_ids)s)
+              AND af.trade_date BETWEEN %(start_date)s AND %(end_date)s
+              AND dc.dataset_code IN ('daily_bar', 'adjustment_factor')
+              AND db.status = 'success'
+              AND db.finished_at IS NOT NULL
+            ORDER BY af.security_id, af.trade_date, af.revision_id DESC, af.ingest_time DESC,
+                     af.batch_id DESC
             """,
             {"security_ids": list(security_map), "start_date": start_date, "end_date": end_date},
         )
@@ -307,7 +460,21 @@ class SqlBackend:
         fields: list[str] | None,
     ) -> dict[str, Any]:
         start_date, end_date = ensure_required_dates(start_date, end_date)
-        security_map = self._resolve_security_map(symbols, None, universe, asof_date=end_date)
+        if symbols and start_date != end_date:
+            security_ids = self._resolve_security_ids_over_range(
+                symbols,
+                start_date,
+                end_date,
+            )
+            security_map: dict[int, str] = {}
+        else:
+            security_map = self._resolve_security_map(
+                symbols,
+                None,
+                universe,
+                asof_date=end_date,
+            )
+            security_ids = list(security_map)
         requested_fields = fields or [
             "is_suspended",
             "is_st",
@@ -322,42 +489,221 @@ class SqlBackend:
         self._validate_fields(requested_fields, self.CONSTRAINT_FIELDS, "fields")
         rows = self.postgres.fetch_all(
             """
+            WITH visible_limits AS (
+                SELECT
+                    lp.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY lp.security_id, lp.trade_date
+                        ORDER BY lp.revision_id DESC, lp.ingest_time DESC,
+                                 lp.batch_id DESC
+                    ) AS revision_rank
+                FROM qmeta.limit_price_daily lp
+                JOIN qmeta.data_batch db_limit ON db_limit.batch_id = lp.batch_id
+                JOIN qmeta.dataset_catalog dc_limit
+                  ON dc_limit.dataset_id = db_limit.dataset_id
+                WHERE lp.security_id = ANY(%(security_ids)s)
+                  AND lp.trade_date BETWEEN %(start_date)s AND %(end_date)s
+                  AND dc_limit.dataset_code IN ('limit_price_daily', 'daily_bar')
+                  AND db_limit.status = 'success'
+                  AND db_limit.finished_at IS NOT NULL
+                  AND db_limit.finished_at < (lp.trade_date + INTERVAL '1 day')
+                  AND lp.ingest_time < (lp.trade_date + INTERVAL '1 day')
+            ),
+            selected_limits AS (
+                SELECT * FROM visible_limits WHERE revision_rank = 1
+            ),
+            visible_suspension_day_revisions AS (
+                SELECT
+                    sh.*,
+                    generated.trade_date::date AS trade_date,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY sh.security_id, sh.start_time,
+                                     generated.trade_date::date
+                        ORDER BY sh.revision_id DESC, sh.ingest_time DESC,
+                                 sh.batch_id DESC
+                    ) AS revision_rank
+                FROM qmeta.suspension_history sh
+                JOIN qmeta.data_batch db_suspension
+                  ON db_suspension.batch_id = sh.batch_id
+                JOIN qmeta.dataset_catalog dc_suspension
+                  ON dc_suspension.dataset_id = db_suspension.dataset_id
+                CROSS JOIN LATERAL generate_series(
+                    GREATEST(sh.start_time::date, %(start_date)s::date),
+                    %(end_date)s::date,
+                    INTERVAL '1 day'
+                ) AS generated(trade_date)
+                WHERE sh.security_id = ANY(%(security_ids)s)
+                  AND sh.start_time::date <= %(end_date)s
+                  AND dc_suspension.dataset_code IN (
+                      'suspension_history', 'daily_bar'
+                  )
+                  AND db_suspension.status = 'success'
+                  AND db_suspension.finished_at IS NOT NULL
+                  AND db_suspension.finished_at <
+                      (generated.trade_date::date + INTERVAL '1 day')
+                  AND sh.announce_time IS NOT NULL
+                  AND sh.announce_time <
+                      (generated.trade_date::date + INTERVAL '1 day')
+                  AND sh.ingest_time <
+                      (generated.trade_date::date + INTERVAL '1 day')
+            ),
+            selected_suspension_days AS (
+                SELECT * FROM visible_suspension_day_revisions
+                WHERE revision_rank = 1
+                  AND start_time::date <= trade_date
+                  AND (end_time IS NULL OR end_time::date >= trade_date)
+            ),
+            constraint_spine AS (
+                SELECT security_id, trade_date FROM selected_limits
+                UNION
+                SELECT security_id, trade_date FROM selected_suspension_days
+            )
             SELECT
                 sm.security_id,
-                lp.trade_date,
+                identifier.symbol || '.' || identifier.exchange AS symbol,
+                spine.trade_date,
                 COALESCE(lp.limit_up, NULL) AS limit_up,
                 COALESCE(lp.limit_down, NULL) AS limit_down,
                 COALESCE(lp.is_st, FALSE) AS is_st,
                 COALESCE(lp.is_new_listing, FALSE) AS is_new_listing,
                 EXISTS (
                     SELECT 1
-                    FROM qmeta.suspension_history sh
-                    WHERE sh.security_id = lp.security_id
-                      AND sh.start_time::date <= lp.trade_date
-                      AND (sh.end_time IS NULL OR sh.end_time::date >= lp.trade_date)
+                    FROM selected_suspension_days suspension_day
+                    WHERE suspension_day.security_id = spine.security_id
+                      AND suspension_day.trade_date = spine.trade_date
                 ) AS is_suspended,
                 COALESCE(st.status = 'delisting_period', FALSE) AS is_delisting_period,
-                GREATEST((lp.trade_date - COALESCE(sm.list_date, lp.trade_date)), 0) AS list_days
-            FROM qmeta.limit_price_daily lp
-            JOIN qmeta.security_master sm ON sm.security_id = lp.security_id
+                GREATEST(
+                    (
+                        spine.trade_date
+                        - COALESCE(
+                            historical_identity.historical_list_date,
+                            spine.trade_date
+                        )
+                    ),
+                    0
+                ) AS list_days
+            FROM constraint_spine spine
+            LEFT JOIN selected_limits lp
+              ON lp.security_id = spine.security_id
+             AND lp.trade_date = spine.trade_date
+            JOIN qmeta.security_master sm ON sm.security_id = spine.security_id
+            JOIN LATERAL (
+                SELECT identifier_revision.symbol, identifier_revision.exchange
+                FROM (
+                    SELECT sih.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY sih.security_id, sih.identifier_type,
+                                         sih.start_date
+                            ORDER BY sih.revision_id DESC, sih.ingest_time DESC,
+                                     sih.batch_id DESC, sih.symbol DESC
+                        ) AS revision_rank
+                    FROM qmeta.security_identifier_history sih
+                    JOIN qmeta.data_batch db_identifier_symbol
+                      ON db_identifier_symbol.batch_id = sih.batch_id
+                    JOIN qmeta.dataset_catalog dc_identifier_symbol
+                      ON dc_identifier_symbol.dataset_id = db_identifier_symbol.dataset_id
+                    WHERE sih.security_id = spine.security_id
+                      AND sih.identifier_type = 'trade_symbol'
+                      AND sih.start_date <= spine.trade_date
+                      AND dc_identifier_symbol.dataset_code = 'security_master'
+                      AND db_identifier_symbol.status = 'success'
+                      AND db_identifier_symbol.finished_at IS NOT NULL
+                      AND db_identifier_symbol.finished_at <
+                          (spine.trade_date + INTERVAL '1 day')
+                      AND sih.announce_time <
+                          (spine.trade_date + INTERVAL '1 day')
+                      AND sih.ingest_time <
+                          (spine.trade_date + INTERVAL '1 day')
+                ) identifier_revision
+                WHERE identifier_revision.revision_rank = 1
+                  AND (identifier_revision.end_date IS NULL
+                       OR identifier_revision.end_date >= spine.trade_date)
+                ORDER BY identifier_revision.start_date DESC,
+                         identifier_revision.revision_id DESC,
+                         identifier_revision.ingest_time DESC,
+                         identifier_revision.batch_id DESC,
+                         identifier_revision.symbol DESC
+                LIMIT 1
+            ) identifier ON TRUE
             LEFT JOIN LATERAL (
-                SELECT status
-                FROM qmeta.security_status_history st
-                WHERE st.security_id = lp.security_id
-                  AND st.start_date <= lp.trade_date
-                  AND (st.end_date IS NULL OR st.end_date >= lp.trade_date)
-                ORDER BY st.start_date DESC, st.revision_id DESC, st.created_at DESC
+                SELECT MIN(identifier_revision.start_date) AS historical_list_date
+                FROM (
+                    SELECT sih.start_date,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY sih.security_id, sih.identifier_type,
+                                         sih.start_date
+                            ORDER BY sih.revision_id DESC, sih.ingest_time DESC,
+                                     sih.batch_id DESC, sih.symbol DESC
+                        ) AS revision_rank
+                    FROM qmeta.security_identifier_history sih
+                    JOIN qmeta.data_batch db_identifier
+                      ON db_identifier.batch_id = sih.batch_id
+                    JOIN qmeta.dataset_catalog dc_identifier
+                      ON dc_identifier.dataset_id = db_identifier.dataset_id
+                    WHERE sih.security_id = spine.security_id
+                      AND sih.identifier_type = 'trade_symbol'
+                      AND sih.start_date <= spine.trade_date
+                      AND dc_identifier.dataset_code = 'security_master'
+                      AND db_identifier.status = 'success'
+                      AND db_identifier.finished_at IS NOT NULL
+                      AND db_identifier.finished_at <
+                          (spine.trade_date + INTERVAL '1 day')
+                      AND sih.announce_time <
+                          (spine.trade_date + INTERVAL '1 day')
+                      AND sih.ingest_time <
+                          (spine.trade_date + INTERVAL '1 day')
+                ) identifier_revision
+                WHERE identifier_revision.revision_rank = 1
+            ) historical_identity ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT status_revision.status
+                FROM (
+                    SELECT st.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY st.security_id, st.start_date
+                            ORDER BY st.revision_id DESC, st.ingest_time DESC,
+                                     st.batch_id DESC, st.status DESC
+                        ) AS revision_rank
+                    FROM qmeta.security_status_history st
+                    JOIN qmeta.data_batch db_status
+                      ON db_status.batch_id = st.batch_id
+                    JOIN qmeta.dataset_catalog dc_status
+                      ON dc_status.dataset_id = db_status.dataset_id
+                    WHERE st.security_id = spine.security_id
+                      AND st.start_date <= spine.trade_date
+                      AND dc_status.dataset_code = 'security_master'
+                      AND db_status.status = 'success'
+                      AND db_status.finished_at IS NOT NULL
+                      AND db_status.finished_at <
+                          (spine.trade_date + INTERVAL '1 day')
+                      AND st.announce_time <
+                          (spine.trade_date + INTERVAL '1 day')
+                      AND st.ingest_time <
+                          (spine.trade_date + INTERVAL '1 day')
+                ) status_revision
+                WHERE status_revision.revision_rank = 1
+                  AND (status_revision.end_date IS NULL
+                       OR status_revision.end_date >= spine.trade_date)
+                ORDER BY status_revision.start_date DESC,
+                         status_revision.revision_id DESC,
+                         status_revision.ingest_time DESC,
+                         status_revision.batch_id DESC,
+                         status_revision.status DESC
                 LIMIT 1
             ) st ON TRUE
-            WHERE lp.security_id = ANY(%(security_ids)s)
-              AND lp.trade_date BETWEEN %(start_date)s AND %(end_date)s
-            ORDER BY lp.security_id, lp.trade_date
+            ORDER BY spine.security_id, spine.trade_date
             """,
-            {"security_ids": list(security_map), "start_date": start_date, "end_date": end_date},
+            {
+                "security_ids": security_ids,
+                "start_date": start_date,
+                "end_date": end_date,
+            },
         )
         normalized = normalize_rows(rows)
         for row in normalized:
-            row["symbol"] = security_map.get(row["security_id"])
+            if not row.get("symbol"):
+                row["symbol"] = security_map.get(row["security_id"])
             blocked = row.get("is_suspended", False) or row.get("is_delisting_period", False)
             row["can_buy"] = not blocked
             row["can_sell"] = not blocked
@@ -468,56 +814,87 @@ class SqlBackend:
             f"""
             WITH source_rows AS (
                 SELECT
-                    security_id,
-                    report_period,
-                    metric_name AS field_name,
-                    metric_value AS field_value,
-                    announce_time,
-                    ingest_time,
-                    revision_id,
-                    is_restated
-                FROM qpit.financial_metric_pit
-                WHERE security_id = ANY(%(security_ids)s)
-                  AND metric_name = ANY(%(fields)s)
-                  AND metric_scope = %(period_type)s
-                  AND announce_time <= (%(asof_date)s::date + INTERVAL '1 day' - INTERVAL '1 second')
-                  AND ingest_time <= (%(asof_date)s::date + INTERVAL '1 day' - INTERVAL '1 second')
+                    'metric'::text AS source_kind,
+                    fm.security_id,
+                    fm.report_period,
+                    fm.metric_scope AS natural_scope,
+                    fm.metric_name AS field_name,
+                    fm.metric_value AS field_value,
+                    fm.announce_time,
+                    fm.effective_time,
+                    fm.ingest_time,
+                    fm.batch_id,
+                    fm.revision_id,
+                    fm.is_restated
+                FROM qpit.financial_metric_pit fm
+                JOIN qmeta.data_batch db_metric
+                  ON db_metric.batch_id = fm.batch_id
+                JOIN qmeta.dataset_catalog dc_metric
+                  ON dc_metric.dataset_id = db_metric.dataset_id
+                WHERE fm.security_id = ANY(%(security_ids)s)
+                  AND fm.metric_name = ANY(%(fields)s)
+                  AND fm.metric_scope = %(period_type)s
+                  AND dc_metric.dataset_code = 'financial_metric_pit'
+                  AND db_metric.status = 'success'
+                  AND db_metric.finished_at IS NOT NULL
+                  AND db_metric.finished_at < (%(asof_date)s::date + INTERVAL '1 day')
+                  AND fm.announce_time < (%(asof_date)s::date + INTERVAL '1 day')
+                  AND fm.effective_time < (%(asof_date)s::date + INTERVAL '1 day')
+                  AND fm.ingest_time < (%(asof_date)s::date + INTERVAL '1 day')
                   {report_filter}
 
                 UNION ALL
 
                 SELECT
-                    security_id,
-                    report_period,
-                    field_name,
-                    field_value,
-                    announce_time,
-                    ingest_time,
-                    revision_id,
-                    is_restated
-                FROM qpit.financial_statement_pit
-                WHERE security_id = ANY(%(security_ids)s)
-                  AND field_name = ANY(%(fields)s)
-                  AND period_type = %(period_type)s
-                  AND announce_time <= (%(asof_date)s::date + INTERVAL '1 day' - INTERVAL '1 second')
-                  AND ingest_time <= (%(asof_date)s::date + INTERVAL '1 day' - INTERVAL '1 second')
+                    'statement:' || fs.statement_type AS source_kind,
+                    fs.security_id,
+                    fs.report_period,
+                    fs.period_type AS natural_scope,
+                    fs.field_name,
+                    fs.field_value,
+                    fs.announce_time,
+                    fs.effective_time,
+                    fs.ingest_time,
+                    fs.batch_id,
+                    fs.revision_id,
+                    fs.is_restated
+                FROM qpit.financial_statement_pit fs
+                JOIN qmeta.data_batch db_statement
+                  ON db_statement.batch_id = fs.batch_id
+                JOIN qmeta.dataset_catalog dc_statement
+                  ON dc_statement.dataset_id = db_statement.dataset_id
+                WHERE fs.security_id = ANY(%(security_ids)s)
+                  AND fs.field_name = ANY(%(fields)s)
+                  AND fs.period_type = %(period_type)s
+                  AND dc_statement.dataset_code = 'financial_statement_pit'
+                  AND db_statement.status = 'success'
+                  AND db_statement.finished_at IS NOT NULL
+                  AND db_statement.finished_at < (%(asof_date)s::date + INTERVAL '1 day')
+                  AND fs.announce_time < (%(asof_date)s::date + INTERVAL '1 day')
+                  AND fs.effective_time < (%(asof_date)s::date + INTERVAL '1 day')
+                  AND fs.ingest_time < (%(asof_date)s::date + INTERVAL '1 day')
                   {report_filter}
             ),
+            revision_ranked AS (
+                SELECT source_rows.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY source_kind, security_id, report_period,
+                                     natural_scope, field_name
+                        ORDER BY revision_id DESC, ingest_time DESC, batch_id DESC
+                    ) AS revision_rank
+                FROM source_rows
+            ),
+            visible_revisions AS (
+                SELECT * FROM revision_ranked WHERE revision_rank = 1
+            ),
             ranked AS (
-                SELECT
-                    security_id,
-                    report_period,
-                    field_name,
-                    field_value,
-                    announce_time,
-                    ingest_time,
-                    revision_id,
-                    is_restated,
+                SELECT visible_revisions.*,
                     ROW_NUMBER() OVER (
                         PARTITION BY security_id, field_name
-                        ORDER BY report_period DESC, announce_time DESC, revision_id DESC
+                        ORDER BY report_period DESC, announce_time DESC,
+                                 ingest_time DESC, revision_id DESC, source_kind DESC
                     ) AS rn
-                FROM source_rows
+                FROM visible_revisions
             )
             SELECT *
             FROM ranked
@@ -562,20 +939,83 @@ class SqlBackend:
             default_fields.append("weight")
         rows = self.postgres.fetch_all(
             """
+            WITH known_revisions AS (
+                SELECT
+                    mp.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY mp.index_id, mp.security_id, mp.effective_date
+                        ORDER BY mp.revision_id DESC, mp.ingest_time DESC,
+                                 mp.batch_id DESC
+                    ) AS revision_rank
+                FROM qpit.index_member_pit mp
+                JOIN qmeta.index_master im_filter ON im_filter.index_id = mp.index_id
+                JOIN qmeta.data_batch db ON db.batch_id = mp.batch_id
+                JOIN qmeta.dataset_catalog dc ON dc.dataset_id = db.dataset_id
+                WHERE im_filter.index_code = %(index_code)s
+                  AND dc.dataset_code = 'index_member_pit'
+                  AND db.status = 'success'
+                  AND db.finished_at IS NOT NULL
+                  AND db.finished_at < (%(asof_date)s::date + INTERVAL '1 day')
+                  AND mp.announce_time IS NOT NULL
+                  AND mp.announce_time < (%(asof_date)s::date + INTERVAL '1 day')
+                  AND mp.ingest_time < (%(asof_date)s::date + INTERVAL '1 day')
+                  AND mp.effective_date <= %(asof_date)s
+            ),
+            selected_members AS (
+                SELECT *
+                FROM known_revisions
+                WHERE revision_rank = 1
+                  AND (end_date IS NULL OR end_date >= %(asof_date)s)
+            )
             SELECT
                 im.index_code,
-                sm.current_symbol || '.' || sm.exchange AS symbol,
+                identifier.symbol || '.' || identifier.exchange AS symbol,
                 sm.security_id,
                 mp.effective_date,
                 mp.end_date,
                 mp.weight
-            FROM qpit.index_member_pit mp
+            FROM selected_members mp
             JOIN qmeta.index_master im ON im.index_id = mp.index_id
             JOIN qmeta.security_master sm ON sm.security_id = mp.security_id
-            WHERE im.index_code = %(index_code)s
-              AND mp.effective_date <= %(asof_date)s
-              AND (mp.end_date IS NULL OR mp.end_date >= %(asof_date)s)
-            ORDER BY mp.weight DESC NULLS LAST, sm.exchange, sm.current_symbol
+            JOIN LATERAL (
+                SELECT identifier_revision.symbol, identifier_revision.exchange
+                FROM (
+                    SELECT sih.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY sih.security_id, sih.identifier_type,
+                                         sih.start_date
+                            ORDER BY sih.revision_id DESC, sih.ingest_time DESC,
+                                     sih.batch_id DESC, sih.symbol DESC
+                        ) AS revision_rank
+                    FROM qmeta.security_identifier_history sih
+                    JOIN qmeta.data_batch db_identifier
+                      ON db_identifier.batch_id = sih.batch_id
+                    JOIN qmeta.dataset_catalog dc_identifier
+                      ON dc_identifier.dataset_id = db_identifier.dataset_id
+                    WHERE sih.security_id = sm.security_id
+                      AND sih.identifier_type = 'trade_symbol'
+                      AND sih.start_date <= %(asof_date)s
+                      AND dc_identifier.dataset_code = 'security_master'
+                      AND db_identifier.status = 'success'
+                      AND db_identifier.finished_at IS NOT NULL
+                      AND db_identifier.finished_at <
+                          (%(asof_date)s::date + INTERVAL '1 day')
+                      AND sih.announce_time <
+                          (%(asof_date)s::date + INTERVAL '1 day')
+                      AND sih.ingest_time <
+                          (%(asof_date)s::date + INTERVAL '1 day')
+                ) identifier_revision
+                WHERE identifier_revision.revision_rank = 1
+                  AND (identifier_revision.end_date IS NULL
+                       OR identifier_revision.end_date >= %(asof_date)s)
+                ORDER BY identifier_revision.start_date DESC,
+                         identifier_revision.revision_id DESC,
+                         identifier_revision.ingest_time DESC,
+                         identifier_revision.batch_id DESC,
+                         identifier_revision.symbol DESC
+                LIMIT 1
+            ) identifier ON TRUE
+            ORDER BY mp.weight DESC NULLS LAST, identifier.exchange, identifier.symbol
             """,
             {"index_code": index_code, "asof_date": asof_date},
         )
@@ -595,8 +1035,88 @@ class SqlBackend:
         security_map = self._resolve_security_map(symbols, None, universe, asof_date=asof_date)
         rows = self.postgres.fetch_all(
             """
+            WITH category_revisions AS (
+                SELECT
+                    ich.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY ich.industry_id, ich.start_date
+                        ORDER BY ich.revision_id DESC, ich.ingest_time DESC,
+                                 ich.batch_id DESC, ich.industry_code DESC,
+                                 ich.industry_name DESC
+                    ) AS revision_rank
+                FROM qmeta.industry_category_history ich
+                JOIN qmeta.industry_system sys_category
+                  ON sys_category.industry_system_id = ich.industry_system_id
+                JOIN qmeta.data_batch db_category
+                  ON db_category.batch_id = ich.batch_id
+                JOIN qmeta.dataset_catalog dc_category
+                  ON dc_category.dataset_id = db_category.dataset_id
+                WHERE sys_category.system_code = %(industry_system)s
+                  AND ich.level = %(level)s
+                  AND ich.start_date <= %(asof_date)s
+                  AND dc_category.dataset_code = 'industry_membership_pit'
+                  AND db_category.status = 'success'
+                  AND db_category.finished_at IS NOT NULL
+                  AND db_category.finished_at <
+                      (%(asof_date)s::date + INTERVAL '1 day')
+                  AND ich.announce_time <
+                      (%(asof_date)s::date + INTERVAL '1 day')
+                  AND ich.ingest_time <
+                      (%(asof_date)s::date + INTERVAL '1 day')
+            ),
+            visible_category_episodes AS (
+                SELECT * FROM category_revisions
+                WHERE revision_rank = 1
+                  AND (end_date IS NULL OR end_date >= %(asof_date)s)
+            ),
+            selected_categories AS (
+                SELECT
+                    visible_category_episodes.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY industry_id
+                        ORDER BY start_date DESC, revision_id DESC,
+                                 ingest_time DESC, batch_id DESC,
+                                 industry_code DESC, industry_name DESC
+                    ) AS category_rank
+                FROM visible_category_episodes
+            ),
+            known_revisions AS (
+                SELECT
+                    mem.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY mem.security_id, mem.industry_system_id,
+                                     cat_filter.level, mem.effective_date
+                        ORDER BY mem.revision_id DESC, mem.ingest_time DESC,
+                                 mem.batch_id DESC, mem.industry_id DESC
+                    ) AS revision_rank
+                FROM qpit.industry_membership_pit mem
+                JOIN qmeta.industry_system sys_filter
+                  ON sys_filter.industry_system_id = mem.industry_system_id
+                JOIN selected_categories cat_filter
+                  ON cat_filter.industry_id = mem.industry_id
+                 AND cat_filter.industry_system_id = mem.industry_system_id
+                 AND cat_filter.category_rank = 1
+                JOIN qmeta.data_batch db ON db.batch_id = mem.batch_id
+                JOIN qmeta.dataset_catalog dc ON dc.dataset_id = db.dataset_id
+                WHERE mem.security_id = ANY(%(security_ids)s)
+                  AND sys_filter.system_code = %(industry_system)s
+                  AND cat_filter.level = %(level)s
+                  AND dc.dataset_code = 'industry_membership_pit'
+                  AND db.status = 'success'
+                  AND db.finished_at IS NOT NULL
+                  AND db.finished_at < (%(asof_date)s::date + INTERVAL '1 day')
+                  AND mem.announce_time IS NOT NULL
+                  AND mem.announce_time < (%(asof_date)s::date + INTERVAL '1 day')
+                  AND mem.ingest_time < (%(asof_date)s::date + INTERVAL '1 day')
+                  AND mem.effective_date <= %(asof_date)s
+            ),
+            selected_members AS (
+                SELECT * FROM known_revisions
+                WHERE revision_rank = 1
+                  AND (end_date IS NULL OR end_date >= %(asof_date)s)
+            )
             SELECT
-                sm.current_symbol || '.' || sm.exchange AS symbol,
+                identifier.symbol || '.' || identifier.exchange AS symbol,
                 sm.security_id,
                 sys.system_code AS industry_system,
                 cat.level,
@@ -604,16 +1124,52 @@ class SqlBackend:
                 cat.industry_name,
                 mem.effective_date,
                 mem.end_date
-            FROM qpit.industry_membership_pit mem
+            FROM selected_members mem
             JOIN qmeta.security_master sm ON sm.security_id = mem.security_id
             JOIN qmeta.industry_system sys ON sys.industry_system_id = mem.industry_system_id
-            JOIN qmeta.industry_category cat ON cat.industry_id = mem.industry_id
-            WHERE mem.security_id = ANY(%(security_ids)s)
-              AND sys.system_code = %(industry_system)s
-              AND cat.level = %(level)s
-              AND mem.effective_date <= %(asof_date)s
-              AND (mem.end_date IS NULL OR mem.end_date >= %(asof_date)s)
-            ORDER BY sm.exchange, sm.current_symbol
+            JOIN selected_categories cat
+              ON cat.industry_id = mem.industry_id
+             AND cat.category_rank = 1
+            JOIN LATERAL (
+                SELECT identifier_revision.symbol, identifier_revision.exchange
+                FROM (
+                    SELECT sih.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY sih.security_id, sih.identifier_type,
+                                         sih.start_date
+                            ORDER BY sih.revision_id DESC, sih.ingest_time DESC,
+                                     sih.batch_id DESC, sih.symbol DESC
+                        ) AS revision_rank
+                    FROM qmeta.security_identifier_history sih
+                    JOIN qmeta.data_batch db_identifier
+                      ON db_identifier.batch_id = sih.batch_id
+                    JOIN qmeta.dataset_catalog dc_identifier
+                      ON dc_identifier.dataset_id = db_identifier.dataset_id
+                    WHERE sih.security_id = sm.security_id
+                      AND sih.identifier_type = 'trade_symbol'
+                      AND sih.start_date <= %(asof_date)s
+                      AND dc_identifier.dataset_code = 'security_master'
+                      AND db_identifier.status = 'success'
+                      AND db_identifier.finished_at IS NOT NULL
+                      AND db_identifier.finished_at <
+                          (%(asof_date)s::date + INTERVAL '1 day')
+                      AND sih.announce_time <
+                          (%(asof_date)s::date + INTERVAL '1 day')
+                      AND sih.ingest_time <
+                          (%(asof_date)s::date + INTERVAL '1 day')
+                ) identifier_revision
+                WHERE identifier_revision.revision_rank = 1
+                  AND (identifier_revision.end_date IS NULL
+                       OR identifier_revision.end_date >= %(asof_date)s)
+                ORDER BY identifier_revision.start_date DESC,
+                         identifier_revision.revision_id DESC,
+                         identifier_revision.ingest_time DESC,
+                         identifier_revision.batch_id DESC,
+                         identifier_revision.symbol DESC
+                LIMIT 1
+            ) identifier ON TRUE
+            WHERE cat.level = %(level)s
+            ORDER BY identifier.exchange, identifier.symbol
             """,
             {
                 "security_ids": list(security_map),
@@ -647,24 +1203,117 @@ class SqlBackend:
         else:
             rows = self.postgres.fetch_all(
                 """
+                WITH definition AS (
+                    SELECT universe_id, universe_code, universe_type
+                    FROM qmeta.universe_definition
+                    WHERE universe_code = %(universe)s
+                ),
+                snapshot_batch AS (
+                    SELECT db.batch_id
+                    FROM qmeta.universe_snapshot us
+                    JOIN definition ud ON ud.universe_id = us.universe_id
+                    JOIN qmeta.data_batch db ON db.batch_id = us.batch_id
+                    JOIN qmeta.dataset_catalog dc ON dc.dataset_id = db.dataset_id
+                    WHERE dc.dataset_code = 'tradable_universe'
+                      AND us.trade_date = %(asof_date)s
+                      AND db.status = 'success'
+                      AND db.finished_at IS NOT NULL
+                      AND db.finished_at < (%(asof_date)s::date + INTERVAL '1 day')
+                    ORDER BY db.finished_at DESC, db.batch_id DESC
+                    LIMIT 1
+                ),
+                known_revisions AS (
+                    SELECT
+                        um.*,
+                        ud.universe_code,
+                        ud.universe_type,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY um.universe_id, um.security_id,
+                                         um.effective_date
+                            ORDER BY um.revision_id DESC, um.ingest_time DESC,
+                                     um.batch_id DESC
+                        ) AS revision_rank
+                    FROM qpit.universe_member_pit um
+                    JOIN definition ud ON ud.universe_id = um.universe_id
+                    JOIN qmeta.data_batch db ON db.batch_id = um.batch_id
+                    JOIN qmeta.dataset_catalog dc ON dc.dataset_id = db.dataset_id
+                    WHERE db.status = 'success'
+                      AND db.finished_at IS NOT NULL
+                      AND db.finished_at < (%(asof_date)s::date + INTERVAL '1 day')
+                      AND um.announce_time IS NOT NULL
+                      AND um.announce_time < (%(asof_date)s::date + INTERVAL '1 day')
+                      AND um.ingest_time < (%(asof_date)s::date + INTERVAL '1 day')
+                      AND (
+                          (
+                              ud.universe_type = 'rule_based'
+                              AND dc.dataset_code = 'tradable_universe'
+                              AND um.batch_id = (SELECT batch_id FROM snapshot_batch)
+                              AND um.effective_date = %(asof_date)s
+                          )
+                          OR (
+                              ud.universe_type <> 'rule_based'
+                              AND dc.dataset_code = 'universe_member_pit'
+                              AND um.effective_date <= %(asof_date)s
+                          )
+                      )
+                ),
+                selected_members AS (
+                    SELECT * FROM known_revisions
+                    WHERE revision_rank = 1
+                      AND (end_date IS NULL OR end_date >= %(asof_date)s)
+                )
                 SELECT
-                    ud.universe_code AS universe,
-                    sm.current_symbol || '.' || sm.exchange AS symbol,
+                    um.universe_code AS universe,
+                    identifier.symbol || '.' || identifier.exchange AS symbol,
                     sm.security_id,
                     %(asof_date)s::date AS asof_date,
                     um.weight
-                FROM qpit.universe_member_pit um
-                JOIN qmeta.universe_definition ud ON ud.universe_id = um.universe_id
+                FROM selected_members um
                 JOIN qmeta.security_master sm ON sm.security_id = um.security_id
-                WHERE ud.universe_code = %(universe)s
-                  AND um.effective_date <= %(asof_date)s
-                  AND (um.end_date IS NULL OR um.end_date >= %(asof_date)s)
-                ORDER BY sm.exchange, sm.current_symbol
+                JOIN LATERAL (
+                    SELECT identifier_revision.symbol, identifier_revision.exchange
+                    FROM (
+                        SELECT sih.*,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY sih.security_id, sih.identifier_type,
+                                             sih.start_date
+                                ORDER BY sih.revision_id DESC, sih.ingest_time DESC,
+                                         sih.batch_id DESC, sih.symbol DESC
+                            ) AS revision_rank
+                        FROM qmeta.security_identifier_history sih
+                        JOIN qmeta.data_batch db_identifier
+                          ON db_identifier.batch_id = sih.batch_id
+                        JOIN qmeta.dataset_catalog dc_identifier
+                          ON dc_identifier.dataset_id = db_identifier.dataset_id
+                        WHERE sih.security_id = sm.security_id
+                          AND sih.identifier_type = 'trade_symbol'
+                          AND sih.start_date <= %(asof_date)s
+                          AND dc_identifier.dataset_code = 'security_master'
+                          AND db_identifier.status = 'success'
+                          AND db_identifier.finished_at IS NOT NULL
+                          AND db_identifier.finished_at <
+                              (%(asof_date)s::date + INTERVAL '1 day')
+                          AND sih.announce_time <
+                              (%(asof_date)s::date + INTERVAL '1 day')
+                          AND sih.ingest_time <
+                              (%(asof_date)s::date + INTERVAL '1 day')
+                    ) identifier_revision
+                    WHERE identifier_revision.revision_rank = 1
+                      AND (identifier_revision.end_date IS NULL
+                           OR identifier_revision.end_date >= %(asof_date)s)
+                    ORDER BY identifier_revision.start_date DESC,
+                             identifier_revision.revision_id DESC,
+                             identifier_revision.ingest_time DESC,
+                             identifier_revision.batch_id DESC,
+                             identifier_revision.symbol DESC
+                    LIMIT 1
+                ) identifier ON TRUE
+                ORDER BY identifier.exchange, identifier.symbol
                 """,
                 {"universe": universe, "asof_date": asof_date},
             )
             rows = normalize_rows(rows)
-        if filters:
+        if filters and rows:
             symbols = [row["symbol"] for row in rows]
             constraints = {
                 row["symbol"]: row
@@ -672,7 +1321,12 @@ class SqlBackend:
             }
             filtered = []
             for row in rows:
-                constraint = constraints.get(row["symbol"], {})
+                constraint = constraints.get(row["symbol"])
+                if constraint is None:
+                    # A filtered universe is a trading decision surface. Missing
+                    # constraint evidence must exclude the member, not silently
+                    # treat every risk flag as false.
+                    continue
                 if filters.get("exclude_st") and constraint.get("is_st"):
                     continue
                 if filters.get("exclude_suspended") and constraint.get("is_suspended"):
@@ -700,6 +1354,11 @@ class SqlBackend:
         query_mode: str,
         format: str,
     ) -> dict[str, Any]:
+        if query_mode != "latest":
+            raise QDataValidationError(
+                "get_factor only supports query_mode='latest'; its public signature "
+                "does not expose a knowledge cutoff or immutable data version"
+            )
         if self.clickhouse is None:
             raise QDataValidationError("clickhouse_dsn or clickhouse client is required for factor queries")
         start_date, end_date = ensure_required_dates(start_date, end_date)
@@ -724,17 +1383,28 @@ class SqlBackend:
             params[version_id_param] = factor["factor_version_id"]
         rows = self.clickhouse.fetch_all(
             f"""
-            SELECT
-                factor_id,
-                factor_version_id,
-                security_id,
-                trade_date,
-                factor_value,
-                quality_flag
-            FROM qts.factor_value_daily FINAL
-            WHERE ({" OR ".join(factor_pair_clauses)})
-              AND security_id IN %(security_ids)s
-              AND trade_date BETWEEN %(start_date)s AND %(end_date)s
+            SELECT factor_id, factor_version_id, security_id, trade_date,
+                   factor_value, quality_flag, data_version, calc_time
+            FROM (
+                SELECT
+                    factor_id,
+                    factor_version_id,
+                    security_id,
+                    trade_date,
+                    factor_value,
+                    quality_flag,
+                    data_version,
+                    calc_time,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY factor_id, factor_version_id, security_id, trade_date
+                        ORDER BY data_version DESC, calc_time DESC
+                    ) AS _qdata_revision_rank
+                FROM qts.factor_value_daily FINAL
+                WHERE ({" OR ".join(factor_pair_clauses)})
+                  AND security_id IN %(security_ids)s
+                  AND trade_date BETWEEN %(start_date)s AND %(end_date)s
+            )
+            WHERE _qdata_revision_rank = 1
             ORDER BY trade_date, security_id, factor_id
             """,
             params,
@@ -808,6 +1478,21 @@ class SqlBackend:
         if not symbols and not security_ids:
             raise QDataValidationError("symbols, security_ids, or universe is required")
 
+        if asof_date:
+            rows = self.get_security_master(
+                symbols=symbols,
+                security_ids=security_ids,
+                asset_types=None,
+                exchanges=None,
+                asof_date=asof_date,
+                include_delisted=True,
+                fields=["security_id", "symbol"],
+            )["data"]
+            result = {row["security_id"]: row["symbol"] for row in rows}
+            if not result:
+                raise QDataNotFoundError("No securities matched the request")
+            return result
+
         where = []
         params: dict[str, Any] = {}
         if symbols:
@@ -832,6 +1517,58 @@ class SqlBackend:
         if not result:
             raise QDataNotFoundError("No securities matched the request")
         return result
+
+    def _resolve_security_ids_over_range(
+        self,
+        symbols: list[str],
+        start_date: str,
+        end_date: str,
+    ) -> list[int]:
+        rows = self.postgres.fetch_all(
+            """
+            WITH qdata_requested_identity_range AS (
+                SELECT
+                    sih.security_id,
+                    sih.symbol,
+                    sih.exchange,
+                    sih.end_date,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY sih.security_id, sih.identifier_type,
+                                     sih.start_date
+                        ORDER BY sih.revision_id DESC, sih.ingest_time DESC,
+                                 sih.batch_id DESC, sih.symbol DESC
+                    ) AS revision_rank
+                FROM qmeta.security_identifier_history sih
+                JOIN qmeta.data_batch db ON db.batch_id = sih.batch_id
+                JOIN qmeta.dataset_catalog dc ON dc.dataset_id = db.dataset_id
+                WHERE sih.identifier_type = 'trade_symbol'
+                  AND sih.start_date <= %(end_date)s
+                  AND dc.dataset_code = 'security_master'
+                  AND db.status = 'success'
+                  AND db.finished_at IS NOT NULL
+                  AND db.finished_at < (%(end_date)s::date + INTERVAL '1 day')
+                  AND sih.announce_time <
+                      (%(end_date)s::date + INTERVAL '1 day')
+                  AND sih.ingest_time <
+                      (%(end_date)s::date + INTERVAL '1 day')
+            )
+            SELECT DISTINCT security_id
+            FROM qdata_requested_identity_range
+            WHERE revision_rank = 1
+              AND (end_date IS NULL OR end_date >= %(start_date)s)
+              AND symbol || '.' || exchange = ANY(%(symbols)s)
+            ORDER BY security_id
+            """,
+            {
+                "symbols": symbols,
+                "start_date": start_date,
+                "end_date": end_date,
+            },
+        )
+        security_ids = [int(row["security_id"]) for row in normalize_rows(rows)]
+        if not security_ids:
+            raise QDataNotFoundError("No securities matched the requested date range")
+        return security_ids
 
     def _resolve_factor_map(self, factors: list[str], factor_version: str) -> dict[int, dict[str, Any]]:
         rows = self.postgres.fetch_all(

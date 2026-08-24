@@ -21,7 +21,7 @@ ON CONFLICT (source_code) DO UPDATE SET
 INSERT INTO qmeta.dataset_catalog (
     dataset_id, dataset_code, dataset_name, asset_type, frequency, storage_layer, primary_source_id, pit_required, description
 ) VALUES
-    (1, 'security_master', '证券主数据', 'stock', NULL, 'postgresql', 2, FALSE, '本地 smoke 主数据'),
+    (1, 'security_master', '证券主数据', 'stock', NULL, 'postgresql', 2, TRUE, '本地 smoke PIT 主数据'),
     (2, 'trading_calendar', '交易日历', NULL, '1d', 'postgresql', 1, FALSE, '本地 smoke 交易日历'),
     (3, 'daily_bar', '日线行情', 'stock', '1d', 'clickhouse', 2, FALSE, '本地 smoke 日线'),
     (4, 'minute_bar', '分钟线行情', 'stock', '1m', 'clickhouse', 2, FALSE, '本地 smoke 分钟线'),
@@ -31,7 +31,8 @@ INSERT INTO qmeta.dataset_catalog (
     (8, 'financial_statement_pit', 'PIT 财务报表', 'stock', 'quarterly', 'postgresql', 2, TRUE, '本地 smoke 财务报表'),
     (9, 'index_member_pit', 'PIT 指数成分', 'stock', 'daily', 'postgresql', 3, TRUE, '本地 smoke 指数成分'),
     (10, 'industry_membership_pit', 'PIT 行业分类', 'stock', 'daily', 'postgresql', 2, TRUE, '本地 smoke 行业分类'),
-    (11, 'factor_value_daily', '日频因子值', 'stock', '1d', 'clickhouse', 2, TRUE, '本地 smoke 因子值')
+    (11, 'factor_value_daily', '日频因子值', 'stock', '1d', 'clickhouse', 2, TRUE, '本地 smoke 因子值'),
+    (12, 'universe_member_pit', 'PIT 股票池成员', 'stock', 'daily', 'postgresql', 2, TRUE, '本地 smoke 股票池成员')
 ON CONFLICT (dataset_code) DO UPDATE SET
     dataset_name = EXCLUDED.dataset_name,
     asset_type = EXCLUDED.asset_type,
@@ -45,25 +46,48 @@ ON CONFLICT (dataset_code) DO UPDATE SET
 INSERT INTO qmeta.data_batch (
     batch_id, dataset_id, source_id, batch_code, trade_date, natural_date, started_at, finished_at, status, raw_uri, row_count
 ) VALUES
-    (1, 1, 2, 'seed-security-master-20240102', '2024-01-02', '2024-01-02', '2024-01-02 18:00:00+08', '2024-01-02 18:00:01+08', 'success', 'seed://security_master', 3),
+    (1, 1, 2, 'seed-security-master-20240102', '2018-06-11', '2018-06-11', '2018-06-11 17:59:59+08', '2018-06-11 18:00:01+08', 'success', 'seed://security_master', 3),
     (2, 3, 2, 'seed-daily-bar-20240102', '2024-01-02', '2024-01-02', '2024-01-02 18:00:00+08', '2024-01-02 18:00:01+08', 'success', 'seed://daily_bar', 5),
-    (3, 7, 2, 'seed-financial-20210630', '2021-06-30', '2021-06-30', '2021-06-30 18:00:00+08', '2021-06-30 18:00:01+08', 'success', 'seed://financial', 6),
+    (3, 7, 2, 'seed-financial-metric-20210331', '2021-03-31', '2021-04-29', '2021-04-27 19:29:00+08', '2021-04-29 00:01:00+08', 'success', 'seed://financial_metric_pit/2021-03-31', 2),
     (4, 5, 2, 'seed-adjustment-factor-20240102', '2024-01-02', '2024-01-02', '2024-01-02 17:59:59+08', '2024-01-02 18:00:01+08', 'success', 'seed://adjustment_factor/2024-01-02', 3),
-    (5, 5, 2, 'seed-adjustment-factor-20240103', '2024-01-03', '2024-01-03', '2024-01-03 17:59:59+08', '2024-01-03 18:00:01+08', 'success', 'seed://adjustment_factor/2024-01-03', 2)
+    (5, 5, 2, 'seed-adjustment-factor-20240103', '2024-01-03', '2024-01-03', '2024-01-03 17:59:59+08', '2024-01-03 18:00:01+08', 'success', 'seed://adjustment_factor/2024-01-03', 2),
+    (6, 8, 2, 'seed-financial-statement-20210331', '2021-03-31', '2021-04-28', '2021-04-27 19:29:00+08', '2021-04-28 00:01:00+08', 'success', 'seed://financial_statement_pit/2021-03-31', 2),
+    (7, 8, 2, 'seed-financial-statement-20210630', '2021-06-30', '2021-08-03', '2021-08-02 19:29:00+08', '2021-08-03 00:01:00+08', 'success', 'seed://financial_statement_pit/2021-06-30', 1),
+    (8, 9, 3, 'seed-index-member-20231211', '2023-12-11', '2023-12-01', '2023-12-01 17:59:00+08', '2023-12-01 18:01:00+08', 'success', 'seed://index_member_pit/2023-12-11', 3),
+    (9, 10, 2, 'seed-industry-membership-20211213', '2021-12-13', '2021-12-10', '2021-12-10 17:59:00+08', '2021-12-10 18:01:00+08', 'success', 'seed://industry_membership_pit/2021-12-13', 3),
+    (10, 12, 2, 'seed-universe-member-20240102', '2024-01-02', '2024-01-02', '2024-01-02 17:59:00+08', '2024-01-02 18:01:00+08', 'success', 'seed://universe_member_pit/2024-01-02', 2),
+    (11, 6, 2, 'seed-limit-price-20240102', '2024-01-02', '2024-01-02', '2024-01-02 17:59:00+08', '2024-01-02 18:01:00+08', 'success', 'seed://limit_price_daily/2024-01-02', 3),
+    (12, 6, 2, 'seed-limit-price-20240103', '2024-01-03', '2024-01-03', '2024-01-03 17:59:00+08', '2024-01-03 18:01:00+08', 'success', 'seed://limit_price_daily/2024-01-03', 2)
 ON CONFLICT (batch_code) DO UPDATE SET
+    dataset_id = EXCLUDED.dataset_id,
+    source_id = EXCLUDED.source_id,
+    trade_date = EXCLUDED.trade_date,
+    natural_date = EXCLUDED.natural_date,
+    started_at = EXCLUDED.started_at,
+    finished_at = EXCLUDED.finished_at,
     status = EXCLUDED.status,
     row_count = EXCLUDED.row_count,
-    finished_at = EXCLUDED.finished_at;
+    raw_uri = EXCLUDED.raw_uri;
 
 INSERT INTO qmeta.dataset_version (
     data_version, dataset_id, version_code, batch_id, valid_from, status, description
 ) VALUES
-    (1, 1, 'security_master:seed-v1', 1, '2024-01-02 18:00:00+08', 'active', '本地 smoke 证券主数据版本'),
+    (1, 1, 'security_master:seed-v1', 1, '2018-06-11 18:00:01+08', 'active', '本地 smoke PIT 证券主数据版本'),
     (2, 3, 'daily_bar:seed-v1', 2, '2024-01-02 18:00:00+08', 'active', '本地 smoke 日线版本'),
-    (3, 7, 'financial_metric_pit:seed-v1', 3, '2021-06-30 18:00:00+08', 'active', '本地 smoke 财务指标版本'),
+    (3, 7, 'financial_metric_pit:seed-v1', 3, '2021-04-29 00:01:00+08', 'active', '本地 smoke 财务指标版本'),
     (4, 5, 'adjustment_factor:seed-20240102-v1', 4, '2024-01-02 18:00:01+08', 'superseded', '本地 smoke 复权因子 2024-01-02 版本'),
-    (5, 5, 'adjustment_factor:seed-20240103-v1', 5, '2024-01-03 18:00:01+08', 'active', '本地 smoke 复权因子 2024-01-03 版本')
+    (5, 5, 'adjustment_factor:seed-20240103-v1', 5, '2024-01-03 18:00:01+08', 'active', '本地 smoke 复权因子 2024-01-03 版本'),
+    (6, 8, 'financial_statement_pit:seed-20210331-v1', 6, '2021-04-28 00:01:00+08', 'superseded', '本地 smoke 财务报表 2021Q1 版本'),
+    (7, 8, 'financial_statement_pit:seed-20210630-v1', 7, '2021-08-03 00:01:00+08', 'active', '本地 smoke 财务报表 2021Q2 版本'),
+    (8, 9, 'index_member_pit:seed-v1', 8, '2023-12-01 18:01:00+08', 'active', '本地 smoke 指数成分版本'),
+    (9, 10, 'industry_membership_pit:seed-v1', 9, '2021-12-10 18:01:00+08', 'active', '本地 smoke 行业分类版本'),
+    (10, 12, 'universe_member_pit:seed-v1', 10, '2024-01-02 18:01:00+08', 'active', '本地 smoke 股票池成员版本'),
+    (11, 6, 'limit_price_daily:seed-20240102-v1', 11, '2024-01-02 18:01:00+08', 'superseded', '本地 smoke 交易约束 2024-01-02 版本'),
+    (12, 6, 'limit_price_daily:seed-20240103-v1', 12, '2024-01-03 18:01:00+08', 'active', '本地 smoke 交易约束 2024-01-03 版本')
 ON CONFLICT (version_code) DO UPDATE SET
+    dataset_id = EXCLUDED.dataset_id,
+    batch_id = EXCLUDED.batch_id,
+    valid_from = EXCLUDED.valid_from,
     status = EXCLUDED.status,
     description = EXCLUDED.description;
 
@@ -83,28 +107,51 @@ ON CONFLICT (asset_type, exchange, current_symbol) DO UPDATE SET
     updated_at = now();
 
 INSERT INTO qmeta.security_identifier_history (
-    security_id, symbol, exchange, identifier_type, start_date, end_date, source_id, revision_id
+    security_id, symbol, exchange, identifier_type, start_date, end_date,
+    announce_time, ingest_time, source_id, batch_id, revision_id, created_at
 ) VALUES
-    (1000001, '600519', 'SH', 'trade_symbol', '2001-08-27', NULL, 2, 1),
-    (1000002, '000001', 'SZ', 'trade_symbol', '1991-04-03', NULL, 2, 1),
-    (1000003, '300750', 'SZ', 'trade_symbol', '2018-06-11', NULL, 2, 1)
-ON CONFLICT DO NOTHING;
+    (1000001, '600519', 'SH', 'trade_symbol', '2001-08-27', NULL, '2001-08-27 09:00:00+08', '2018-06-11 18:00:00+08', 2, 1, 1, '2018-06-11 18:00:00+08'),
+    (1000002, '000001', 'SZ', 'trade_symbol', '1991-04-03', NULL, '1991-04-03 09:00:00+08', '2018-06-11 18:00:00+08', 2, 1, 1, '2018-06-11 18:00:00+08'),
+    (1000003, '300750', 'SZ', 'trade_symbol', '2018-06-11', NULL, '2018-06-11 09:00:00+08', '2018-06-11 18:00:00+08', 2, 1, 1, '2018-06-11 18:00:00+08')
+ON CONFLICT (security_id, identifier_type, symbol, start_date, revision_id) DO UPDATE SET
+    end_date = EXCLUDED.end_date,
+    announce_time = EXCLUDED.announce_time,
+    ingest_time = EXCLUDED.ingest_time,
+    source_id = EXCLUDED.source_id,
+    batch_id = EXCLUDED.batch_id,
+    created_at = EXCLUDED.created_at;
 
 INSERT INTO qmeta.security_name_history (
-    security_id, name, start_date, end_date, source_id, revision_id
+    security_id, name, start_date, end_date, announce_time, ingest_time,
+    source_id, batch_id, revision_id, created_at
 ) VALUES
-    (1000001, '贵州茅台', '2001-08-27', NULL, 2, 1),
-    (1000002, '平安银行', '1991-04-03', NULL, 2, 1),
-    (1000003, '宁德时代', '2018-06-11', NULL, 2, 1)
-ON CONFLICT DO NOTHING;
+    (1000001, '贵州茅台', '2001-08-27', NULL, '2001-08-27 09:00:00+08', '2018-06-11 18:00:00+08', 2, 1, 1, '2018-06-11 18:00:00+08'),
+    (1000002, '平安银行', '1991-04-03', NULL, '1991-04-03 09:00:00+08', '2018-06-11 18:00:00+08', 2, 1, 1, '2018-06-11 18:00:00+08'),
+    (1000003, '宁德时代', '2018-06-11', NULL, '2018-06-11 09:00:00+08', '2018-06-11 18:00:00+08', 2, 1, 1, '2018-06-11 18:00:00+08')
+ON CONFLICT (security_id, start_date, revision_id) DO UPDATE SET
+    name = EXCLUDED.name,
+    end_date = EXCLUDED.end_date,
+    announce_time = EXCLUDED.announce_time,
+    ingest_time = EXCLUDED.ingest_time,
+    source_id = EXCLUDED.source_id,
+    batch_id = EXCLUDED.batch_id,
+    created_at = EXCLUDED.created_at;
 
 INSERT INTO qmeta.security_status_history (
-    security_id, status, start_date, end_date, reason, source_id, revision_id
+    security_id, status, start_date, end_date, reason, announce_time,
+    ingest_time, source_id, batch_id, revision_id, created_at
 ) VALUES
-    (1000001, 'active', '2001-08-27', NULL, 'seed active status', 2, 1),
-    (1000002, 'active', '1991-04-03', NULL, 'seed active status', 2, 1),
-    (1000003, 'active', '2018-06-11', NULL, 'seed active status', 2, 1)
-ON CONFLICT DO NOTHING;
+    (1000001, 'active', '2001-08-27', NULL, 'seed active status', '2001-08-27 09:00:00+08', '2018-06-11 18:00:00+08', 2, 1, 1, '2018-06-11 18:00:00+08'),
+    (1000002, 'active', '1991-04-03', NULL, 'seed active status', '1991-04-03 09:00:00+08', '2018-06-11 18:00:00+08', 2, 1, 1, '2018-06-11 18:00:00+08'),
+    (1000003, 'active', '2018-06-11', NULL, 'seed active status', '2018-06-11 09:00:00+08', '2018-06-11 18:00:00+08', 2, 1, 1, '2018-06-11 18:00:00+08')
+ON CONFLICT (security_id, status, start_date, revision_id) DO UPDATE SET
+    end_date = EXCLUDED.end_date,
+    reason = EXCLUDED.reason,
+    announce_time = EXCLUDED.announce_time,
+    ingest_time = EXCLUDED.ingest_time,
+    source_id = EXCLUDED.source_id,
+    batch_id = EXCLUDED.batch_id,
+    created_at = EXCLUDED.created_at;
 
 INSERT INTO qmeta.trading_calendar (
     exchange, trade_date, is_open, session_type, pretrade_date, next_trade_date, open_time, close_time, source_id
@@ -135,22 +182,23 @@ INSERT INTO qmeta.adjustment_factor (
 ON CONFLICT DO NOTHING;
 
 INSERT INTO qmeta.limit_price_daily (
-    security_id, trade_date, limit_up, limit_down, limit_rule, is_st, is_new_listing, source_id, batch_id, revision_id
+    security_id, trade_date, limit_up, limit_down, limit_rule, is_st, is_new_listing,
+    source_id, batch_id, ingest_time, revision_id
 ) VALUES
-    (1000001, '2024-01-02', 1842.500000, 1507.500000, 'main_10pct', FALSE, FALSE, 2, 2, 1),
-    (1000001, '2024-01-03', 1867.800000, 1528.200000, 'main_10pct', FALSE, FALSE, 2, 2, 1),
-    (1000002, '2024-01-02', 10.380000, 8.500000, 'main_10pct', FALSE, FALSE, 2, 2, 1),
-    (1000002, '2024-01-03', 10.540000, 8.620000, 'main_10pct', FALSE, FALSE, 2, 2, 1),
-    (1000003, '2024-01-02', 189.480000, 126.320000, 'gem_20pct', FALSE, FALSE, 2, 2, 1)
+    (1000001, '2024-01-02', 1842.500000, 1507.500000, 'main_10pct', FALSE, FALSE, 2, 11, '2024-01-02 18:00:00+08', 1),
+    (1000001, '2024-01-03', 1867.800000, 1528.200000, 'main_10pct', FALSE, FALSE, 2, 12, '2024-01-03 18:00:00+08', 1),
+    (1000002, '2024-01-02', 10.380000, 8.500000, 'main_10pct', FALSE, FALSE, 2, 11, '2024-01-02 18:00:00+08', 1),
+    (1000002, '2024-01-03', 10.540000, 8.620000, 'main_10pct', FALSE, FALSE, 2, 12, '2024-01-03 18:00:00+08', 1),
+    (1000003, '2024-01-02', 189.480000, 126.320000, 'gem_20pct', FALSE, FALSE, 2, 11, '2024-01-02 18:00:00+08', 1)
 ON CONFLICT DO NOTHING;
 
 INSERT INTO qpit.financial_statement_pit (
     security_id, report_period, statement_type, period_type, field_name, field_value, unit,
     announce_time, effective_time, ingest_time, source_id, batch_id, revision_id, is_restated, quality_flag
 ) VALUES
-    (1000001, '2021-03-31', 'income_statement', 'ttm', 'revenue', 27271000000.00000000, 'CNY', '2021-04-27 19:30:00+08', '2021-04-28 00:00:00+08', '2021-04-27 19:31:00+08', 2, 3, 1, FALSE, 'normal'),
-    (1000001, '2021-03-31', 'income_statement', 'ttm', 'net_profit_parent', 13954000000.00000000, 'CNY', '2021-04-27 19:30:00+08', '2021-04-28 00:00:00+08', '2021-04-27 19:31:00+08', 2, 3, 1, FALSE, 'normal'),
-    (1000001, '2021-06-30', 'income_statement', 'ttm', 'revenue', 50722000000.00000000, 'CNY', '2021-08-02 19:30:00+08', '2021-08-03 00:00:00+08', '2021-08-02 19:31:00+08', 2, 3, 1, FALSE, 'normal')
+    (1000001, '2021-03-31', 'income_statement', 'ttm', 'revenue', 27271000000.00000000, 'CNY', '2021-04-27 19:30:00+08', '2021-04-28 00:00:00+08', '2021-04-27 19:31:00+08', 2, 6, 1, FALSE, 'normal'),
+    (1000001, '2021-03-31', 'income_statement', 'ttm', 'net_profit_parent', 13954000000.00000000, 'CNY', '2021-04-27 19:30:00+08', '2021-04-28 00:00:00+08', '2021-04-27 19:31:00+08', 2, 6, 1, FALSE, 'normal'),
+    (1000001, '2021-06-30', 'income_statement', 'ttm', 'revenue', 50722000000.00000000, 'CNY', '2021-08-02 19:30:00+08', '2021-08-03 00:00:00+08', '2021-08-02 19:31:00+08', 2, 7, 1, FALSE, 'normal')
 ON CONFLICT DO NOTHING;
 
 INSERT INTO qpit.financial_metric_pit (
@@ -172,11 +220,12 @@ ON CONFLICT (index_code, provider) DO UPDATE SET
     updated_at = now();
 
 INSERT INTO qpit.index_member_pit (
-    index_id, security_id, effective_date, end_date, weight, announce_time, source_id, batch_id, revision_id
+    index_id, security_id, effective_date, end_date, weight, announce_time,
+    ingest_time, source_id, batch_id, revision_id
 ) VALUES
-    (300, 1000001, '2023-12-11', NULL, 0.0612000000, '2023-12-01 18:00:00+08', 3, 1, 1),
-    (300, 1000002, '2023-12-11', NULL, 0.0048000000, '2023-12-01 18:00:00+08', 3, 1, 1),
-    (852, 1000003, '2023-12-11', NULL, 0.0081000000, '2023-12-01 18:00:00+08', 3, 1, 1)
+    (300, 1000001, '2023-12-11', NULL, 0.0612000000, '2023-12-01 18:00:00+08', '2023-12-01 18:00:30+08', 3, 8, 1),
+    (300, 1000002, '2023-12-11', NULL, 0.0048000000, '2023-12-01 18:00:00+08', '2023-12-01 18:00:30+08', 3, 8, 1),
+    (852, 1000003, '2023-12-11', NULL, 0.0081000000, '2023-12-01 18:00:00+08', '2023-12-01 18:00:30+08', 3, 8, 1)
 ON CONFLICT DO NOTHING;
 
 INSERT INTO qmeta.industry_system (
@@ -200,12 +249,34 @@ ON CONFLICT (industry_system_id, industry_code, level) DO UPDATE SET
     start_date = EXCLUDED.start_date,
     end_date = EXCLUDED.end_date;
 
-INSERT INTO qpit.industry_membership_pit (
-    security_id, industry_system_id, industry_id, effective_date, end_date, announce_time, source_id, batch_id, revision_id
+INSERT INTO qmeta.industry_category_history (
+    industry_id, industry_system_id, industry_code, industry_name, level,
+    parent_industry_id, start_date, end_date, announce_time, ingest_time,
+    source_id, batch_id, revision_id, created_at
 ) VALUES
-    (1000001, 1, 101, '2021-12-13', NULL, '2021-12-10 18:00:00+08', 2, 1, 1),
-    (1000002, 1, 102, '2021-12-13', NULL, '2021-12-10 18:00:00+08', 2, 1, 1),
-    (1000003, 1, 103, '2021-12-13', NULL, '2021-12-10 18:00:00+08', 2, 1, 1)
+    (101, 1, '801120', '食品饮料', 1, NULL, '2021-12-13', NULL, '2021-12-10 18:00:00+08', '2021-12-10 18:00:30+08', 2, 9, 1, '2021-12-10 18:00:30+08'),
+    (102, 1, '801780', '银行', 1, NULL, '2021-12-13', NULL, '2021-12-10 18:00:00+08', '2021-12-10 18:00:30+08', 2, 9, 1, '2021-12-10 18:00:30+08'),
+    (103, 1, '801730', '电力设备', 1, NULL, '2021-12-13', NULL, '2021-12-10 18:00:00+08', '2021-12-10 18:00:30+08', 2, 9, 1, '2021-12-10 18:00:30+08')
+ON CONFLICT (industry_id, start_date, revision_id) DO UPDATE SET
+    industry_system_id = EXCLUDED.industry_system_id,
+    industry_code = EXCLUDED.industry_code,
+    industry_name = EXCLUDED.industry_name,
+    level = EXCLUDED.level,
+    parent_industry_id = EXCLUDED.parent_industry_id,
+    end_date = EXCLUDED.end_date,
+    announce_time = EXCLUDED.announce_time,
+    ingest_time = EXCLUDED.ingest_time,
+    source_id = EXCLUDED.source_id,
+    batch_id = EXCLUDED.batch_id,
+    created_at = EXCLUDED.created_at;
+
+INSERT INTO qpit.industry_membership_pit (
+    security_id, industry_system_id, industry_id, effective_date, end_date,
+    announce_time, ingest_time, source_id, batch_id, revision_id
+) VALUES
+    (1000001, 1, 101, '2021-12-13', NULL, '2021-12-10 18:00:00+08', '2021-12-10 18:00:30+08', 2, 9, 1),
+    (1000002, 1, 102, '2021-12-13', NULL, '2021-12-10 18:00:00+08', '2021-12-10 18:00:30+08', 2, 9, 1),
+    (1000003, 1, 103, '2021-12-13', NULL, '2021-12-10 18:00:00+08', '2021-12-10 18:00:30+08', 2, 9, 1)
 ON CONFLICT DO NOTHING;
 
 INSERT INTO qmeta.universe_definition (
@@ -218,10 +289,11 @@ ON CONFLICT (universe_code) DO UPDATE SET
     updated_at = now();
 
 INSERT INTO qpit.universe_member_pit (
-    universe_id, security_id, effective_date, end_date, weight, announce_time, revision_id, source_id, batch_id
+    universe_id, security_id, effective_date, end_date, weight, announce_time,
+    ingest_time, revision_id, source_id, batch_id
 ) VALUES
-    (800, 1000001, '2024-01-02', NULL, 0.6000000000, '2024-01-02 18:00:00+08', 1, 2, 1),
-    (800, 1000002, '2024-01-02', NULL, 0.4000000000, '2024-01-02 18:00:00+08', 1, 2, 1)
+    (800, 1000001, '2024-01-02', NULL, 0.6000000000, '2024-01-02 18:00:00+08', '2024-01-02 18:00:30+08', 1, 2, 10),
+    (800, 1000002, '2024-01-02', NULL, 0.4000000000, '2024-01-02 18:00:00+08', '2024-01-02 18:00:30+08', 1, 2, 10)
 ON CONFLICT DO NOTHING;
 
 INSERT INTO qmeta.factor_definition (

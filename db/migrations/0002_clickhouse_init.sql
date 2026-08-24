@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS qts.factor_value_daily
 )
 ENGINE = ReplacingMergeTree(calc_time)
 PARTITION BY toYYYYMM(trade_date)
-ORDER BY (factor_id, trade_date, security_id, factor_version_id);
+ORDER BY (factor_id, trade_date, security_id, factor_version_id, data_version);
 
 CREATE TABLE IF NOT EXISTS qts.factor_quality_daily
 (

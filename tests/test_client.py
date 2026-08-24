@@ -5,6 +5,21 @@ from qdata.exceptions import QDataValidationError
 
 
 class ClientTest(unittest.TestCase):
+    def test_historical_security_master_does_not_filter_by_current_delisted_status(self) -> None:
+        client = Client(default_format="records")
+        security = client._backend.securities[0]
+        security["status"] = "delisted"
+        security["delist_date"] = "2025-01-01"
+
+        rows = client.get_security_master(
+            security_ids=[security["security_id"]],
+            asof_date="2024-01-02",
+            include_delisted=False,
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "active")
+
     def test_get_price_returns_forward_adjusted_records(self) -> None:
         client = Client(default_format="records")
 
