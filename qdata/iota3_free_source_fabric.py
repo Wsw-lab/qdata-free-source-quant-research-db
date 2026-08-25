@@ -570,6 +570,10 @@ def _security_rows(records: list[Any]) -> list[dict[str, Any]]:
             "list_date": record.list_date,
             "delist_date": record.delist_date,
             "status": record.status,
+            "status_effective_date": record.status_effective_date,
+            "security_id": record.security_id,
+            "identifier_effective_date": record.identifier_effective_date,
+            "name_effective_date": record.name_effective_date,
         }
         for record in records
     ]

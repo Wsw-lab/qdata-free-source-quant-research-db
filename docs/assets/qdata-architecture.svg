@@ -88,9 +88,9 @@
   <text class="label" x="978" y="813">Factor demo and notebooks</text>
 
   <rect class="pill" x="72" y="872" width="162" height="30"/>
-  <text class="pill-text" x="94" y="892">291 tests passing</text>
+  <text class="pill-text" x="94" y="892">Offline unittest suite</text>
   <rect class="pill" x="254" y="872" width="200" height="30"/>
-  <text class="pill-text" x="276" y="892">73 console smoke markers</text>
+  <text class="pill-text" x="276" y="892">Optional local console smoke</text>
   <rect class="pill" x="474" y="872" width="176" height="30"/>
   <text class="pill-text" x="496" y="892">0 RMB research route</text>
 </svg>

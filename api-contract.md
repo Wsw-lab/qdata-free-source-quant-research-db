@@ -69,6 +69,10 @@ Accept: application/json
 - 时间戳：ISO 8601，例如 `2026-07-23T15:00:00+08:00`
 - 默认时区：`Asia/Shanghai`
 
+仅接收日期的 PIT selector 将该日期解释为 `Asia/Shanghai` 自然日，并以“次日
+00:00（上海时区）”作为排他 knowledge cutoff；它不依赖 PostgreSQL session
+timezone。需要盘中边界的接口必须传入带时区的 `asof_time`，不能用无时区时间戳。
+
 ### 3.5 证券代码格式
 
 外部接口使用标准代码：
@@ -1791,6 +1795,10 @@ POST /v1/market/price
 - 默认返回长表。
 - 后续可增加 `format=wide`，但不改变默认响应。
 - `adjust=forward/backward` 只调整价格字段，不调整成交量和成交额。
+- 范围查询先解析覆盖日期内的稳定 `security_id`，再按每个 `trade_date` 的历史
+  identifier 返回 `symbol`，不会用区间结束日的 current symbol 回填全段。
+- 同一请求 ticker 在范围内被回收给多个 `security_id` 时会 fail closed；调用者须
+  使用 `security_ids` 消除歧义。某日缺失或重复历史 identifier 也不会回退到 current。
 
 ### 5.4 获取复权因子
 
@@ -1819,6 +1827,12 @@ POST /v1/market/adjustment-factor
 | `factor_backward` | number | 后复权因子 |
 | `ex_right_type` | string | 除权除息类型 |
 
+公开复权因子接口当前只支持 `latest`。SQL selector 仅接纳与
+`adjustment_factor` dataset 精确绑定、批次 `success` 且已完成、版本状态为
+`active`/`superseded` 的行；orphan、running、failed 或 `recalled` 版本不可见。
+范围结果与行情一致，按每个交易日标注历史 ticker；`asof`/`vintage` 因当前签名
+不能完整表达 cutoff/version 而 fail closed。
+
 ### 5.5 获取交易约束
 
 ```http
@@ -1845,6 +1859,13 @@ POST /v1/market/trading-constraints
 - `can_sell`
 - `list_days`
 - `is_delisting_period`
+
+选择规则：涨跌停与停牌 episode 分别按 natural key 先应用成功、已完成批次和
+逐日上海时区 knowledge cutoff，再选择确定性最新 revision；二者的日期并集构成
+返回 spine，因此 suspension-only 记录不会因缺少涨跌停行而消失。`is_st`
+来自当日 PIT security status（含 `star_st`），不会把缺少 limit-price 行误写为
+`false`。`is_new_listing`、`list_days`、退市整理期等没有证据时保持 unknown；依赖
+这些字段的股票池过滤和 `can_buy`/`can_sell` 会 fail closed。
 
 响应示例：
 
@@ -1912,8 +1933,10 @@ POST /v1/fundamentals/asof
 
 PIT 规则：
 
-- `announce_time` 必须不晚于 `asof_date` 收盘后可见时点。
-- 默认 `asof_date` 被解释为当日 23:59:59。
+- `announce_time`、`ingest_time` 必须早于 `asof_date` 次日
+  `00:00 Asia/Shanghai`，且只读取成功、已完成批次。
+- revision winner 按 natural key 在可见记录中确定性选择；不读取 current master
+  来替代历史身份或状态。
 - 严格盘中回测应使用 `asof_time`，后续版本支持。
 
 ### 5.7 获取指数成分
@@ -1951,6 +1974,10 @@ POST /v1/index/members/asof
 | `end_date` | string | 结束日期 |
 | `weight` | number | 权重 |
 
+指数选择器先按 natural key 在成功、已完成批次和上海时区 knowledge cutoff 内选择
+确定性 revision，再按成分实体保留截至 `asof_date` 的最新 effective episode，避免
+重叠 episode 返回同一证券多行。
+
 ### 5.8 获取行业分类
 
 ```http
@@ -1977,6 +2004,11 @@ POST /v1/industry/asof
 | `industry_code` | string | 行业代码 |
 | `industry_name` | string | 行业名称 |
 | `effective_date` | string | 生效日期 |
+
+行业归属和代码/名称均来自带 `batch_id`、`announce_time`、`ingest_time` 与
+`revision_id` 的历史行；选择器先限制成功、已完成批次和上海时区 knowledge
+cutoff，按 natural key 选 revision，再按证券保留最新 effective episode，不读取
+current category label。
 
 ### 5.9 获取股票池
 
@@ -2016,6 +2048,11 @@ POST /v1/universe/query
 }
 ```
 
+非规则股票池使用同样的成功批次、knowledge cutoff、revision 与最新 effective
+episode 规则。snapshot 型 producer 每次写入完整当日集合，因此空快照能清空旧
+集合；同日重跑追加单调 revision，不覆盖旧行。`universe_type` 一经创建不可原地
+修改，避免历史查询被重新解释。
+
 ### 5.10 获取因子值
 
 ```http
@@ -2032,7 +2069,7 @@ POST /v1/factors/values
 | `start_date` | string | 是 | 无 | 开始日期 |
 | `end_date` | string | 是 | 无 | 结束日期 |
 | `factor_version` | string | 否 | `published` | 因子版本 |
-| `query_mode` | string | 否 | `asof` | 默认 asof |
+| `query_mode` | string | 否 | `latest` | 当前只支持 `latest`；`asof`/`vintage` fail closed |
 | `format` | string | 否 | `long` | `long` 或 `wide` |
 
 请求示例：
@@ -2043,7 +2080,7 @@ POST /v1/factors/values
   "universe": "zz800",
   "start_date": "2024-01-01",
   "end_date": "2024-12-31",
-  "query_mode": "asof",
+  "query_mode": "latest",
   "format": "long"
 }
 ```
@@ -2058,6 +2095,13 @@ POST /v1/factors/values
 | `factor_value` | number | 因子值 |
 | `factor_version` | string | 因子版本 |
 | `quality_flag` | string | 质量标记 |
+
+`latest` 先从 PostgreSQL 解析与 `factor_value_daily` dataset 精确绑定、批次
+`success` 且已完成、状态为 `active`/`superseded` 的 dataset versions，再用该集合
+限制 ClickHouse；orphan、running、failed、`recalled` 版本不可见。相同
+identity/data-version/calc-time 的完全相同重试可确定性折叠，不同
+`factor_value`/`quality_flag`/`universe_id` 则 fail closed。范围结果按每个
+`trade_date` 标注历史 ticker；ticker recycling 歧义不会用 current symbol 掩盖。
 
 ### 5.11 获取数据版本
 
@@ -2242,10 +2286,17 @@ factors = client.get_factor(
     universe="zz800",
     start_date="2024-01-01",
     end_date="2024-12-31",
-    query_mode="asof",
+    query_mode="latest",
     format="long"
 )
 ```
+
+当前公开 `get_factor` 与 `get_adjustment_factor` 签名不能完整表达 knowledge
+cutoff 或固定数据版本，因此只支持 `query_mode="latest"`；传入 `asof` 或
+`vintage` 会 fail closed。`start_date`/`end_date` 只过滤经济日期，不是 PIT
+可见性边界。SQL latest 只接纳成功、已完成、精确 batch-bound 且未 recalled 的
+dataset version；因子 payload 冲突会 fail closed。价格接口仍可按其完整参数使用
+下表三种模式。
 
 ### 6.11 `get_dataset_health`
 

@@ -11,7 +11,11 @@ class SecurityRecord:
     currency: str = "CNY"
     list_date: str | None = None
     delist_date: str | None = None
-    status: str = "active"
+    status: str | None = None
+    status_effective_date: str | None = None
+    security_id: int | None = None
+    identifier_effective_date: str | None = None
+    name_effective_date: str | None = None
 
     @property
     def code(self) -> str:

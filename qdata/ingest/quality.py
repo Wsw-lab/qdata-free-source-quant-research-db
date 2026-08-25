@@ -245,7 +245,7 @@ def _check_completeness(
         report.add(
             "daily_bar",
             "daily_bar_completeness_below_threshold",
-            "medium",
+            "high",
             f"daily bar completeness {completeness_rate:.4f} is below threshold {min_completeness:.4f}",
         )
 

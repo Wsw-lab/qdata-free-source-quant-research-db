@@ -398,15 +398,24 @@ class MockBackend:
             rows = [row for row in rows if row["asset_type"] in set(asset_types)]
         if exchanges:
             rows = [row for row in rows if row["exchange"] in set(exchanges)]
-        if not include_delisted:
-            rows = [row for row in rows if row["status"] != "delisted"]
         if asof_date:
             self._parse_date(asof_date, "asof_date")
             rows = [
-                row
+                {
+                    **row,
+                    "status": (
+                        "active"
+                        if row["status"] == "delisted"
+                        and row["delist_date"] is not None
+                        and asof_date < row["delist_date"]
+                        else row["status"]
+                    ),
+                }
                 for row in rows
                 if row["list_date"] <= asof_date and (row["delist_date"] is None or row["delist_date"] >= asof_date)
             ]
+        if not include_delisted:
+            rows = [row for row in rows if row["status"] != "delisted"]
         return self._response(self._project(rows, fields), ["security_master:mock-v1"], "asof" if asof_date else "latest")
 
     def get_trading_calendar(
@@ -487,6 +496,11 @@ class MockBackend:
         factor_type: str,
         query_mode: str,
     ) -> dict[str, Any]:
+        if query_mode != "latest":
+            raise QDataValidationError(
+                "get_adjustment_factor only supports query_mode='latest'; its public "
+                "signature does not expose a knowledge cutoff or immutable data version"
+            )
         if not start_date or not end_date:
             raise QDataValidationError("start_date and end_date are required")
         self._date_range(start_date, end_date)
@@ -759,6 +773,11 @@ class MockBackend:
         query_mode: str,
         format: str,
     ) -> dict[str, Any]:
+        if query_mode != "latest":
+            raise QDataValidationError(
+                "get_factor only supports query_mode='latest'; its public signature "
+                "does not expose a knowledge cutoff or immutable data version"
+            )
         if not start_date or not end_date:
             raise QDataValidationError("start_date and end_date are required")
         self._date_range(start_date, end_date)

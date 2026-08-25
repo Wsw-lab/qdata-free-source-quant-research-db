@@ -7,7 +7,24 @@ __pycache__/
 .venv/
 .venv312/
 venv/
+.env
+.env.*
+!.env.example
+
+# Local database, log, coverage, and generated experiment artifacts.
+*.log
+.coverage
+coverage.xml
+htmlcov/
+reports/
+outputs/
+artifacts/
+research_snapshots/
+build/
+dist/
+*.egg-info/
 
 # Generated raw import snapshots are append-only runtime artifacts.
 raw/imports/
 raw/vendor/
+raw/exports/

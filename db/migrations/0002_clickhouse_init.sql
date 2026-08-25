@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS qts.daily_bar
 )
 ENGINE = ReplacingMergeTree(ingest_time)
 PARTITION BY toYYYYMM(trade_date)
-ORDER BY (security_id, trade_date);
+ORDER BY (security_id, trade_date, data_version);
 
 CREATE TABLE IF NOT EXISTS qts.minute_bar
 (
@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS qts.minute_bar
 )
 ENGINE = ReplacingMergeTree(ingest_time)
 PARTITION BY toYYYYMM(trade_date)
-ORDER BY (security_id, trade_date, bar_time);
+ORDER BY (security_id, trade_date, bar_time, data_version);
 
 CREATE TABLE IF NOT EXISTS qts.factor_value_daily
 (
@@ -63,9 +63,12 @@ CREATE TABLE IF NOT EXISTS qts.factor_value_daily
     data_version        UInt64,
     quality_flag        LowCardinality(String)
 )
-ENGINE = ReplacingMergeTree(calc_time)
+-- Plain MergeTree intentionally preserves exact-key duplicates.  The read
+-- path must detect equal data_version/calc_time conflicts and fail closed,
+-- a replacing engine could erase that evidence during a background merge.
+ENGINE = MergeTree
 PARTITION BY toYYYYMM(trade_date)
-ORDER BY (factor_id, trade_date, security_id, factor_version_id);
+ORDER BY (factor_id, trade_date, security_id, factor_version_id, data_version);
 
 CREATE TABLE IF NOT EXISTS qts.factor_quality_daily
 (

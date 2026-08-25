@@ -19,8 +19,8 @@
 
 | 文件 | 数据库 | 类型 | 说明 |
 |---|---|---|---|
-| `db/migrations/0001_postgresql_init.sql` | PostgreSQL | 初始化 | 创建 `qmeta`、`qpit` schema 及元数据/PIT 表 |
-| `db/migrations/0002_clickhouse_init.sql` | ClickHouse | 初始化 | 创建 `qts` 库及行情/因子时间序列表 |
+| `db/migrations/0001_postgresql_init.sql` | PostgreSQL | canonical 初始化 | PostgreSQL fresh install 的唯一 canonical DDL，创建 `qmeta`、`qpit` schema 及元数据/PIT 表 |
+| `db/migrations/0002_clickhouse_init.sql` | ClickHouse | canonical 初始化 | ClickHouse fresh install 的唯一 canonical DDL，创建 `qts` 库及行情/因子时间序列表 |
 | `db/migrations/0003_postgresql_pipeline_scheduler.sql` | PostgreSQL | 增量 | 新增 pipeline job/run/watermark 调度表 |
 | `db/migrations/0004_postgresql_full_market_pipeline.sql` | PostgreSQL | 增量 | 为全市场生产新增批次、完整性和缺失证券字段 |
 | `db/migrations/0005_postgresql_production_gamma.sql` | PostgreSQL | 增量 | 新增交易所级完整率字段和生产修复队列表 |
@@ -74,27 +74,42 @@
 | `db/migrations/0053_postgresql_automation_epsilon6_route_incident_approval_resilience.sql` | PostgreSQL | 增量 | 新增路由故障审批并发锁、状态机转移、不可变审计哈希链、SLA 动作、恢复演练和 15m 韧性调度 |
 | `db/migrations/0054_postgresql_automation_zeta6_route_incident_approval_release.sql` | PostgreSQL | 增量 | 新增路由故障审批跨环境发布 preflight、密钥轮换证据、并发压测摘要、监管审计导出包和 30m 发布调度 |
 | `db/migrations/0055_postgresql_vendor_eta6_production_source_closure.sql` | PostgreSQL | 增量 | 新增真实供应商生产主源闭环 run、dataset check、decision 审计和 30m 调度 |
+| `db/migrations/0056_clickhouse_durable_vintage.sql` | ClickHouse | 增量 | 重建日线、分钟线排序键，使每个 `data_version` 在合并后仍可审计 |
+| `db/migrations/0057_clickhouse_factor_durable_vintage.sql` | ClickHouse | 增量 | 重建因子值排序键，使每个 `data_version` 在合并后仍可审计 |
+| `db/migrations/0058_postgresql_universe_snapshot.sql` | PostgreSQL | 增量 | 为规则股票池建立带批次血缘的持久快照身份，包含空快照 |
+| `db/migrations/0059_postgresql_security_history_lineage.sql` | PostgreSQL | 增量 | 为证券代码、名称、状态历史补齐公告/入库/批次因果血缘并扩展状态约束 |
+| `db/migrations/0060_postgresql_industry_category_history.sql` | PostgreSQL | 增量 | 新增具备因果血缘的行业分类名称与层级历史 |
+| `db/migrations/0061_postgresql_universe_type_immutable.sql` | PostgreSQL | 增量 | 安装触发器，拒绝原地修改 `universe_type` 造成历史语义漂移 |
+| `db/migrations/0062_clickhouse_factor_conflict_preservation.sql` | ClickHouse | 增量 | 将因子值表重建为普通 `MergeTree`，持久保留同版本同计算时点的冲突证据供读取层 fail closed |
 | `db/seed/postgresql_seed.sql` | PostgreSQL | 初始化数据 | 写入本地联调最小主数据、PIT、指数、行业和因子元数据 |
 | `db/seed/clickhouse_seed.sql` | ClickHouse | 初始化数据 | 写入本地联调最小行情、分钟线和因子值 |
-| `db/table.sql` | PostgreSQL + ClickHouse | 汇总 | 与根目录 `core-data-model-ddl.sql` 保持一致的建表汇总 |
-| `db/update.sql` | PostgreSQL + ClickHouse | 增量占位 | MVP 之后的兼容变更入口 |
+| `db/table.sql` | PostgreSQL + ClickHouse | 参考快照 | 跨数据库的当前结构参考和 schema contract 测试输入，不是可执行迁移入口 |
+| `db/update.sql` | PostgreSQL | 兼容入口 | 供 `psql` 从仓库根目录顺序执行 PostgreSQL 增量；ClickHouse 迁移只列出、不在其中执行 |
+| `core-data-model-ddl.sql` | 无 | 已弃用 | 明确的非执行 stub；仅把调用方导向 canonical 初始化和版本化迁移 |
 | `db/rollback.sql` | PostgreSQL + ClickHouse | 回滚 | 删除本次初始化创建的对象 |
 
 ## 3. 执行顺序
 
-1. 在 PostgreSQL 执行 `db/migrations/0001_postgresql_init.sql`。
-2. 在 ClickHouse 执行 `db/migrations/0002_clickhouse_init.sql`。
+1. 在 PostgreSQL 执行 canonical `db/migrations/0001_postgresql_init.sql`。
+2. 在 ClickHouse 执行 canonical `db/migrations/0002_clickhouse_init.sql`。
 3. 在 PostgreSQL 执行 `db/seed/postgresql_seed.sql`。
 4. 在 ClickHouse 执行 `db/seed/clickhouse_seed.sql`。
 5. 跑数据质量检查任务，确认表结构和索引可用。
 
 本地 Docker 环境会自动按以上顺序执行。
 
+已有 PostgreSQL 环境使用 `scripts/apply_postgres_migrations.sh`（推荐）或从仓库根目录以
+`psql` 执行 `db/update.sql`。ClickHouse 环境则按编号分别执行
+`0056_clickhouse_durable_vintage.sql`、`0057_clickhouse_factor_durable_vintage.sql`
+与 `0062_clickhouse_factor_conflict_preservation.sql`；
+两种数据库方言不得混在同一客户端会话中执行。
+
 ## 4. 兼容旧数据
 
 当前仓库没有历史业务表，因此本次是全新初始化，不涉及旧表迁移。
 
-`0003` 到 `0055` 均为兼容增量：
+PostgreSQL 的 `0003` 到 `0055`、`0058` 到 `0061`，以及 ClickHouse 的
+`0056`、`0057`、`0062` 均为 forward-only 兼容增量：
 
 - 新表使用 `CREATE TABLE IF NOT EXISTS`。
 - 新字段使用 `ADD COLUMN IF NOT EXISTS`。
@@ -152,6 +167,12 @@
 - `0053` 只追加 Epsilon-6 approval lock/state/audit/SLA/recovery 五张韧性表和 15m schedule；企业微信回调在 Delta-6 前先进入 advisory lock、状态机守卫和不可变审计哈希链，SLA 自动处置只生成 planned action 和恢复演练证据，不产生真实外部副作用，不绕过 Delta-6/Gamma-6/Omega 审批控制面。
 - `0054` 只追加 Zeta-6 release preflight、secret rotation evidence、concurrency test、audit export 四张发布/审计表和 30m schedule；企业微信回调支持 current/next 双密钥验签选择，但只记录 secret label 和摘要证据，不保存密钥原文。
 - `0055` 只追加 Eta-6 真实供应商生产主源闭环 run、dataset check、decision 三张审计表和 30m schedule；闭环读取 Omicron-5 到 Upsilon-5 的合同、pilot、promotion、稳定性、成本和路由证据，只保存 token digest/脱敏配置，不保存 `QDATA_VENDOR_TOKEN` 原文，不直接改写 source priority 或 route policy。
+- `0056` 与 `0057` 通过 ClickHouse create-copy-exchange 流程补齐行情和因子表的 durable vintage 排序键；执行前停止 merge，交换后保留旧表作为可核验备份，不由 `psql` 入口执行。
+- `0058` 只追加 universe snapshot 身份表，使空规则快照也能绑定成功批次，不改写成员历史。
+- `0059` 只为证券身份历史追加 nullable 因果血缘，并扩展当前状态约束；无法证明血缘的旧记录保持不可见，不伪造回填。
+- `0060` 只追加行业分类标签历史；旧 current-category 不自动复制，需经可审计批次重新摄取。
+- `0061` 只安装 `universe_type` 不可变触发器；名称、描述和 owner 仍可更新，类型变化必须新建 universe，旧成员历史不被重释。
+- `0062` 把 `factor_value_daily` 从 `ReplacingMergeTree(calc_time)` 重建为普通 `MergeTree`；相同业务键、`data_version` 与 `calc_time` 的矛盾行不再被后台合并静默删除，读取层可据此拒绝不确定结果。迁移无法恢复在执行前已经被合并删除的行。
 
 后续如果已有客户数据，需要遵守：
 

@@ -9,6 +9,32 @@ detect_applied_postgres_prefix() {
   local marker
   marker="$(docker compose exec -T postgres psql -U qdata -d qdata -At <<'SQL'
 SELECT CASE
+  -- 0001 intentionally carries the latest core/PIT shape, including the
+  -- 0058-0061 objects.  A late marker only advances the linear upgrade prefix
+  -- after the independent 0003-0055 chain is also present.
+  WHEN to_regclass('qmeta.vendor_production_source_run') IS NOT NULL
+    AND EXISTS (
+    SELECT 1
+    FROM pg_trigger trigger_row
+    JOIN pg_class table_row ON table_row.oid = trigger_row.tgrelid
+    JOIN pg_namespace schema_row ON schema_row.oid = table_row.relnamespace
+    WHERE schema_row.nspname = 'qmeta'
+      AND table_row.relname = 'universe_definition'
+      AND trigger_row.tgname = 'trg_universe_type_immutable'
+      AND NOT trigger_row.tgisinternal
+  ) THEN '0061'
+  WHEN to_regclass('qmeta.vendor_production_source_run') IS NOT NULL
+    AND to_regclass('qmeta.industry_category_history') IS NOT NULL THEN '0060'
+  WHEN to_regclass('qmeta.vendor_production_source_run') IS NOT NULL
+    AND EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'qmeta'
+      AND table_name = 'security_identifier_history'
+      AND column_name = 'batch_id'
+  ) THEN '0059'
+  WHEN to_regclass('qmeta.vendor_production_source_run') IS NOT NULL
+    AND to_regclass('qmeta.universe_snapshot') IS NOT NULL THEN '0058'
   WHEN to_regclass('qmeta.vendor_production_source_run') IS NOT NULL THEN '0055'
   WHEN to_regclass('qmeta.source_route_incident_approval_release_preflight') IS NOT NULL THEN '0054'
   WHEN to_regclass('qmeta.source_route_incident_approval_recovery_drill') IS NOT NULL THEN '0053'

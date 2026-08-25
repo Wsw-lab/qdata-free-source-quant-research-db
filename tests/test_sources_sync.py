@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from qdata.exceptions import QDataProviderError
 from qdata.sources.export import export_daily_market_bundle
 from qdata.sources.providers.akshare_provider import AkShareProvider
 from qdata.sources.providers.csv_provider import CsvProvider
@@ -31,17 +32,39 @@ class SourceSyncTest(unittest.TestCase):
         self.assertTrue(provider.is_trade_date("2024-01-04"))
         self.assertFalse(provider.is_trade_date("2024-01-05"))
 
-    def test_csv_provider_derives_constraints_and_minute_bars(self) -> None:
-        provider = CsvProvider()
+    def test_csv_provider_derives_constraints_and_reads_explicit_minute_bars(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            minute_path = self._write_minute_fixture(directory)
+            provider = CsvProvider(minute_bar_path=minute_path)
 
-        constraints = provider.fetch_market_constraints("2024-01-04", symbols=["600519.SH", "000001.SZ"])
-        minutes = provider.fetch_minute_market("2024-01-04", symbols=["600519.SH"])
+            constraints = provider.fetch_market_constraints("2024-01-04", symbols=["600519.SH", "000001.SZ"])
+            minutes = provider.fetch_minute_market("2024-01-04", symbols=["600519.SH"])
 
         self.assertEqual(len(constraints.adjustment_factors), 2)
         self.assertEqual(len(constraints.limit_prices), 2)
         self.assertEqual(constraints.limit_prices[0].limit_rule, "main_10pct")
         self.assertEqual(len(minutes.minute_bars), 1)
         self.assertEqual(minutes.minute_bars[0].bar_time, "2024-01-04 09:31:00")
+
+    def test_csv_provider_does_not_fabricate_minutes_from_daily_bars(self) -> None:
+        provider = CsvProvider(minute_bar_path="raw/samples/does-not-exist-minute.csv")
+
+        with self.assertRaisesRegex(QDataProviderError, "daily bars cannot be substituted"):
+            provider.fetch_minute_market("2024-01-04", symbols=["600519.SH"])
+
+    def test_akshare_minute_failure_does_not_fall_back_to_daily_bar(self) -> None:
+        provider = AkShareProvider()
+        provider._import_akshare = lambda: FailingMinuteAkShare()
+
+        with self.assertRaisesRegex(QDataProviderError, "minute fetch failed for 600519.SH"):
+            provider.fetch_minute_market("2024-01-04", symbols=["600519.SH"])
+
+    def test_akshare_empty_minute_response_is_not_replaced_with_daily_bar(self) -> None:
+        provider = AkShareProvider()
+        provider._import_akshare = lambda: EmptyMinuteAkShare()
+
+        with self.assertRaisesRegex(QDataProviderError, "returned no minute bars for 600519.SH"):
+            provider.fetch_minute_market("2024-01-04", symbols=["600519.SH"])
 
     def test_export_daily_market_bundle_writes_three_csv_files(self) -> None:
         provider = CsvProvider()
@@ -100,10 +123,13 @@ class SourceSyncTest(unittest.TestCase):
             self.assertEqual(result["completeness"]["actual_count"], 2)
             self.assertEqual(result["completeness"]["missing_symbols"], ["300750.SZ"])
             self.assertEqual(result["completeness"]["missing_by_exchange"], {"SZ": ["300750.SZ"]})
-            self.assertEqual(result["quality_report"].warning_count, 2)
+            self.assertFalse(result["quality_report"].passed)
+            self.assertEqual(result["quality_report"].error_count, 1)
+            self.assertEqual(result["quality_report"].warning_count, 1)
 
     def test_delta_sync_dry_run_exports_constraints_and_minutes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            minute_path = self._write_minute_fixture(directory)
             constraints = sync_market_constraints(
                 provider_name="csv",
                 trade_date="2024-01-04",
@@ -116,6 +142,7 @@ class SourceSyncTest(unittest.TestCase):
                     "security_master_path": "raw/samples/security_master.csv",
                     "trading_calendar_path": "raw/samples/trading_calendar.csv",
                     "daily_bar_path": "raw/samples/daily_bar.csv",
+                    "minute_bar_path": minute_path,
                 },
             )
             minutes = sync_minute_market(
@@ -130,6 +157,7 @@ class SourceSyncTest(unittest.TestCase):
                     "security_master_path": "raw/samples/security_master.csv",
                     "trading_calendar_path": "raw/samples/trading_calendar.csv",
                     "daily_bar_path": "raw/samples/daily_bar.csv",
+                    "minute_bar_path": minute_path,
                 },
             )
 
@@ -238,6 +266,16 @@ class SourceSyncTest(unittest.TestCase):
         self.assertEqual([record.symbol for record in securities], ["000001.SZ", "600519.SH", "920001.BJ"])
         self.assertEqual(securities[1].name, "贵州茅台")
 
+    @staticmethod
+    def _write_minute_fixture(directory: str) -> str:
+        path = Path(directory) / "minute_bar.csv"
+        path.write_text(
+            "symbol,trade_date,bar_time,open,high,low,close,volume,amount,vwap\n"
+            "600519.SH,2024-01-04,2024-01-04 09:31:00,10,10.1,9.9,10,100,1000,10\n",
+            encoding="utf-8",
+        )
+        return str(path)
+
 
 class FakeAkShare:
     def __init__(self, code_name_df) -> None:
@@ -245,6 +283,16 @@ class FakeAkShare:
 
     def stock_info_a_code_name(self):
         return self._code_name_df
+
+
+class FailingMinuteAkShare:
+    def stock_zh_a_hist_min_em(self, **kwargs):
+        raise RuntimeError("upstream minute endpoint unavailable")
+
+
+class EmptyMinuteAkShare:
+    def stock_zh_a_hist_min_em(self, **kwargs):
+        return FakeDataFrame([], [])
 
 
 class FakeDataFrame:

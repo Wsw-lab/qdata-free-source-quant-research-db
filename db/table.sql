@@ -1,7 +1,9 @@
--- 中国量化金融数据底座核心数据模型 DDL
+-- 中国量化金融数据底座结构参考快照（非迁移入口）
 -- 说明：
--- 1. PostgreSQL 负责主数据、元数据、PIT 数据、权限审计和事件状态。
--- 2. ClickHouse 负责行情、分钟线、因子值等大规模时间序列。
+-- 1. canonical fresh-install 入口是 db/migrations/0001_postgresql_init.sql
+--    与 db/migrations/0002_clickhouse_init.sql；升级只执行版本化 migrations。
+-- 2. 本文件把 PostgreSQL 与 ClickHouse 两种方言汇总在一起，仅供审阅和
+--    schema contract 测试使用，不应整体交给任一数据库客户端执行。
 -- 3. 所有时间字段默认使用 Asia/Shanghai 业务语义，服务层统一转换和校验。
 
 -- ============================================================
@@ -101,7 +103,12 @@ CREATE TABLE IF NOT EXISTS qmeta.security_master (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (asset_type, exchange, current_symbol),
     CHECK (asset_type IN ('stock', 'etf', 'lof', 'convertible_bond', 'index', 'future', 'option', 'fund')),
-    CHECK (current_status IN ('prelisted', 'active', 'suspended', 'delisted', 'terminated', 'unknown'))
+    CONSTRAINT ck_security_master_current_status CHECK (
+        current_status IN (
+            'prelisted', 'active', 'suspended', 'st', 'star_st',
+            'delisting_period', 'delisted', 'terminated', 'unknown'
+        )
+    )
 );
 
 CREATE INDEX IF NOT EXISTS idx_security_master_symbol
@@ -114,7 +121,10 @@ CREATE TABLE IF NOT EXISTS qmeta.security_identifier_history (
     identifier_type     VARCHAR(32) NOT NULL DEFAULT 'trade_symbol',
     start_date          DATE NOT NULL,
     end_date            DATE,
+    announce_time       TIMESTAMPTZ NOT NULL,
+    ingest_time         TIMESTAMPTZ NOT NULL DEFAULT now(),
     source_id           BIGINT REFERENCES qmeta.source_system(source_id),
+    batch_id            BIGINT NOT NULL REFERENCES qmeta.data_batch(batch_id),
     revision_id         BIGINT NOT NULL DEFAULT 1,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (security_id, identifier_type, symbol, start_date, revision_id),
@@ -129,7 +139,10 @@ CREATE TABLE IF NOT EXISTS qmeta.security_name_history (
     name                VARCHAR(128) NOT NULL,
     start_date          DATE NOT NULL,
     end_date            DATE,
+    announce_time       TIMESTAMPTZ NOT NULL,
+    ingest_time         TIMESTAMPTZ NOT NULL DEFAULT now(),
     source_id           BIGINT REFERENCES qmeta.source_system(source_id),
+    batch_id            BIGINT NOT NULL REFERENCES qmeta.data_batch(batch_id),
     revision_id         BIGINT NOT NULL DEFAULT 1,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (security_id, start_date, revision_id),
@@ -142,7 +155,10 @@ CREATE TABLE IF NOT EXISTS qmeta.security_status_history (
     start_date          DATE NOT NULL,
     end_date            DATE,
     reason              TEXT,
+    announce_time       TIMESTAMPTZ NOT NULL,
+    ingest_time         TIMESTAMPTZ NOT NULL DEFAULT now(),
     source_id           BIGINT REFERENCES qmeta.source_system(source_id),
+    batch_id            BIGINT NOT NULL REFERENCES qmeta.data_batch(batch_id),
     revision_id         BIGINT NOT NULL DEFAULT 1,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (security_id, status, start_date, revision_id),
@@ -384,6 +400,30 @@ CREATE TABLE IF NOT EXISTS qmeta.industry_category (
     UNIQUE (industry_system_id, industry_code, level)
 );
 
+CREATE TABLE IF NOT EXISTS qmeta.industry_category_history (
+    industry_id         BIGINT NOT NULL REFERENCES qmeta.industry_category(industry_id),
+    industry_system_id  BIGINT NOT NULL REFERENCES qmeta.industry_system(industry_system_id),
+    industry_code       VARCHAR(64) NOT NULL,
+    industry_name       VARCHAR(128) NOT NULL,
+    level               SMALLINT NOT NULL,
+    parent_industry_id  BIGINT REFERENCES qmeta.industry_category(industry_id),
+    start_date          DATE NOT NULL,
+    end_date            DATE,
+    announce_time       TIMESTAMPTZ NOT NULL,
+    ingest_time         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    source_id           BIGINT REFERENCES qmeta.source_system(source_id),
+    batch_id            BIGINT NOT NULL REFERENCES qmeta.data_batch(batch_id),
+    revision_id         BIGINT NOT NULL DEFAULT 1,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (industry_id, start_date, revision_id),
+    CHECK (end_date IS NULL OR end_date >= start_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_industry_category_history_asof
+    ON qmeta.industry_category_history(
+        industry_system_id, level, start_date, ingest_time, batch_id
+    );
+
 CREATE TABLE IF NOT EXISTS qpit.industry_membership_pit (
     security_id         BIGINT NOT NULL REFERENCES qmeta.security_master(security_id),
     industry_system_id  BIGINT NOT NULL REFERENCES qmeta.industry_system(industry_system_id),
@@ -413,6 +453,44 @@ CREATE TABLE IF NOT EXISTS qmeta.universe_definition (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (universe_type IN ('index', 'rule_based', 'manual', 'strategy'))
 );
+
+-- A universe's type determines which PIT selection contract applies.  Changing
+-- it in place would reinterpret existing membership history, so type changes
+-- must be represented by a new universe_definition row instead.
+CREATE OR REPLACE FUNCTION qmeta.reject_universe_type_change()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NEW.universe_type IS DISTINCT FROM OLD.universe_type THEN
+        RAISE EXCEPTION
+            'universe_type is immutable for universe_id %; create a new universe instead',
+            OLD.universe_id
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_universe_type_immutable
+    ON qmeta.universe_definition;
+
+CREATE TRIGGER trg_universe_type_immutable
+    BEFORE UPDATE OF universe_type ON qmeta.universe_definition
+    FOR EACH ROW
+    EXECUTE FUNCTION qmeta.reject_universe_type_change();
+
+CREATE TABLE IF NOT EXISTS qmeta.universe_snapshot (
+    snapshot_id         BIGSERIAL PRIMARY KEY,
+    universe_id         BIGINT NOT NULL REFERENCES qmeta.universe_definition(universe_id),
+    trade_date          DATE NOT NULL,
+    batch_id            BIGINT NOT NULL REFERENCES qmeta.data_batch(batch_id),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (universe_id, trade_date, batch_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_universe_snapshot_selection
+    ON qmeta.universe_snapshot(universe_id, trade_date, batch_id DESC);
 
 CREATE TABLE IF NOT EXISTS qpit.universe_member_pit (
     universe_id         BIGINT NOT NULL REFERENCES qmeta.universe_definition(universe_id),
@@ -2603,7 +2681,7 @@ CREATE TABLE IF NOT EXISTS qts.daily_bar
 )
 ENGINE = ReplacingMergeTree(ingest_time)
 PARTITION BY toYYYYMM(trade_date)
-ORDER BY (security_id, trade_date);
+ORDER BY (security_id, trade_date, data_version);
 
 CREATE TABLE IF NOT EXISTS qts.minute_bar
 (
@@ -2625,7 +2703,7 @@ CREATE TABLE IF NOT EXISTS qts.minute_bar
 )
 ENGINE = ReplacingMergeTree(ingest_time)
 PARTITION BY toYYYYMM(trade_date)
-ORDER BY (security_id, trade_date, bar_time);
+ORDER BY (security_id, trade_date, bar_time, data_version);
 
 CREATE TABLE IF NOT EXISTS qts.factor_value_daily
 (
@@ -2639,9 +2717,12 @@ CREATE TABLE IF NOT EXISTS qts.factor_value_daily
     data_version        UInt64,
     quality_flag        LowCardinality(String)
 )
-ENGINE = ReplacingMergeTree(calc_time)
+-- Plain MergeTree intentionally preserves exact-key duplicates.  The read
+-- path must detect equal data_version/calc_time conflicts and fail closed,
+-- a replacing engine could erase that evidence during a background merge.
+ENGINE = MergeTree
 PARTITION BY toYYYYMM(trade_date)
-ORDER BY (factor_id, trade_date, security_id, factor_version_id);
+ORDER BY (factor_id, trade_date, security_id, factor_version_id, data_version);
 
 CREATE TABLE IF NOT EXISTS qts.factor_quality_daily
 (

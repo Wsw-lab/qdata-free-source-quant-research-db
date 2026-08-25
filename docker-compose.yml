@@ -10,7 +10,7 @@ services:
       POSTGRES_DB: qdata
       TZ: Asia/Shanghai
     ports:
-      - "15432:5432"
+      - "127.0.0.1:15432:5432"
     volumes:
       - qdata-postgres-data:/var/lib/postgresql/data
       - ./db/migrations/0001_postgresql_init.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
@@ -83,8 +83,8 @@ services:
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
       TZ: Asia/Shanghai
     ports:
-      - "18123:8123"
-      - "19000:9000"
+      - "127.0.0.1:18123:8123"
+      - "127.0.0.1:19000:9000"
     volumes:
       - qdata-clickhouse-data:/var/lib/clickhouse
       - ./db/migrations/0002_clickhouse_init.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
@@ -181,7 +181,7 @@ services:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       TZ: Asia/Shanghai
     ports:
-      - "18080:18080"
+      - "127.0.0.1:18080:18080"
     volumes:
       - ./:/app:ro
     command: >

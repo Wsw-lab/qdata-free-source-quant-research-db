@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install pinned packaging toolchain
+        run: python -m pip install --disable-pip-version-check --no-deps -r .github/ci-toolchain.txt
+      - name: Verify packaging toolchain versions
+        shell: bash
+        run: |
+          python - <<'PY'
+          from importlib.metadata import version
+
+          expected = {
+              "pip": "26.2.1",
+              "setuptools": "84.0.0",
+              "wheel": "0.48.0",
+              "packaging": "26.3",
+          }
+          actual = {package: version(package) for package in expected}
+          for package in expected:
+              print(f"{package}=={actual[package]}")
+          if actual != expected:
+              raise SystemExit(f"packaging toolchain mismatch: {actual!r}")
+          PY
+      - name: Install package
+        run: python -m pip install --no-index --no-deps --no-build-isolation -e .
+      - name: Verify installed package import
+        working-directory: ${{ runner.temp }}
+        run: python -c "import qdata; print(qdata.__file__)"
+      - name: Run deterministic unit suite
+        run: python -m unittest discover -s tests -p 'test_*.py'
+      - name: Build, verify, and repeat research_snapshot_v1
+        shell: bash
+        run: |
+          snapshot_root="$(mktemp -d)"
+          trap 'rm -rf "$snapshot_root"' EXIT
+          python examples/build_research_snapshot.py build "$snapshot_root/first"
+          python examples/build_research_snapshot.py verify "$snapshot_root/first"
+          python examples/build_research_snapshot.py build "$snapshot_root/second"
+          diff -r "$snapshot_root/first" "$snapshot_root/second"
+      - name: Run public quickstart
+        run: python examples/quickstart.py
+      - name: Run factor API arithmetic example
+        run: |
+          python -m unittest -v tests.test_factor_api_arithmetic_demo
+          python examples/factor_api_arithmetic_demo.py

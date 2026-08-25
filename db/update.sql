@@ -1,6 +1,8 @@
--- A 股量化数据底座 MVP 增量变更脚本
--- 当前版本为全新初始化，暂无增量变更。
--- 后续兼容性变更在此文件追加，禁止直接修改已发布迁移脚本。
+-- PostgreSQL forward-migration compatibility entrypoint.
+-- Fresh installs use the canonical db/migrations/0001_postgresql_init.sql.
+-- Run this file with psql from the repository root; it intentionally includes
+-- PostgreSQL migrations only. Never send the ClickHouse files named below to
+-- psql.
 
 -- Example:
 -- ALTER TABLE qmeta.dataset_catalog ADD COLUMN IF NOT EXISTS owner_team VARCHAR(128);
@@ -58,3 +60,14 @@
 \i db/migrations/0053_postgresql_automation_epsilon6_route_incident_approval_resilience.sql
 \i db/migrations/0054_postgresql_automation_zeta6_route_incident_approval_release.sql
 \i db/migrations/0055_postgresql_vendor_eta6_production_source_closure.sql
+
+-- ClickHouse upgrades are separate engine-specific entrypoints. Run each with
+-- clickhouse-client (or the documented ClickHouse migration runner), in order:
+-- db/migrations/0056_clickhouse_durable_vintage.sql
+-- db/migrations/0057_clickhouse_factor_durable_vintage.sql
+-- db/migrations/0062_clickhouse_factor_conflict_preservation.sql
+
+\i db/migrations/0058_postgresql_universe_snapshot.sql
+\i db/migrations/0059_postgresql_security_history_lineage.sql
+\i db/migrations/0060_postgresql_industry_category_history.sql
+\i db/migrations/0061_postgresql_universe_type_immutable.sql

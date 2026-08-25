@@ -1,0 +1,6 @@
+# Packaging bootstrap for the supported Python 3.10-3.12 CI matrix.
+# Keep exact pins so a clean runner's build backend is reproducible and auditable.
+pip==26.2.1
+setuptools==84.0.0
+wheel==0.48.0
+packaging==26.3

@@ -152,10 +152,16 @@ class AkShareProvider:
                     period="1",
                     adjust="",
                 )
-                minute_bars.extend(self._minute_df_to_bars(symbol, minute_df, trade_date))
-            except Exception:
-                daily = self.fetch_daily_market(trade_date=trade_date, symbols=[symbol])
-                minute_bars.extend(_minute_from_daily(record) for record in daily.daily_bars)
+            except Exception as exc:
+                raise QDataProviderError(
+                    f"akshare minute fetch failed for {symbol} on {trade_date}: {exc}"
+                ) from exc
+            mapped = self._minute_df_to_bars(symbol, minute_df, trade_date)
+            if not mapped:
+                raise QDataProviderError(
+                    f"akshare returned no minute bars for {symbol} on {trade_date}"
+                )
+            minute_bars.extend(mapped)
         return MinuteMarketBundle(
             provider="akshare",
             trade_date=trade_date,
@@ -484,18 +490,3 @@ def _limit_rule(symbol: str) -> str:
     if code.startswith(("30", "68")):
         return "growth_20pct"
     return "main_10pct"
-
-
-def _minute_from_daily(record: DailyBarRecord) -> MinuteBarRecord:
-    return MinuteBarRecord(
-        symbol=record.symbol,
-        trade_date=record.trade_date,
-        bar_time=f"{record.trade_date} 09:31:00",
-        open=record.open,
-        high=record.high,
-        low=record.low,
-        close=record.close,
-        volume=record.volume,
-        amount=record.amount,
-        vwap=record.vwap,
-    )
