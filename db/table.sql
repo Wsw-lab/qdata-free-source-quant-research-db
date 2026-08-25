@@ -1,7 +1,9 @@
--- 中国量化金融数据底座核心数据模型 DDL
+-- 中国量化金融数据底座结构参考快照（非迁移入口）
 -- 说明：
--- 1. PostgreSQL 负责主数据、元数据、PIT 数据、权限审计和事件状态。
--- 2. ClickHouse 负责行情、分钟线、因子值等大规模时间序列。
+-- 1. canonical fresh-install 入口是 db/migrations/0001_postgresql_init.sql
+--    与 db/migrations/0002_clickhouse_init.sql；升级只执行版本化 migrations。
+-- 2. 本文件把 PostgreSQL 与 ClickHouse 两种方言汇总在一起，仅供审阅和
+--    schema contract 测试使用，不应整体交给任一数据库客户端执行。
 -- 3. 所有时间字段默认使用 Asia/Shanghai 业务语义，服务层统一转换和校验。
 
 -- ============================================================
@@ -451,6 +453,32 @@ CREATE TABLE IF NOT EXISTS qmeta.universe_definition (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (universe_type IN ('index', 'rule_based', 'manual', 'strategy'))
 );
+
+-- A universe's type determines which PIT selection contract applies.  Changing
+-- it in place would reinterpret existing membership history, so type changes
+-- must be represented by a new universe_definition row instead.
+CREATE OR REPLACE FUNCTION qmeta.reject_universe_type_change()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NEW.universe_type IS DISTINCT FROM OLD.universe_type THEN
+        RAISE EXCEPTION
+            'universe_type is immutable for universe_id %; create a new universe instead',
+            OLD.universe_id
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_universe_type_immutable
+    ON qmeta.universe_definition;
+
+CREATE TRIGGER trg_universe_type_immutable
+    BEFORE UPDATE OF universe_type ON qmeta.universe_definition
+    FOR EACH ROW
+    EXECUTE FUNCTION qmeta.reject_universe_type_change();
 
 CREATE TABLE IF NOT EXISTS qmeta.universe_snapshot (
     snapshot_id         BIGSERIAL PRIMARY KEY,
@@ -2689,7 +2717,10 @@ CREATE TABLE IF NOT EXISTS qts.factor_value_daily
     data_version        UInt64,
     quality_flag        LowCardinality(String)
 )
-ENGINE = ReplacingMergeTree(calc_time)
+-- Plain MergeTree intentionally preserves exact-key duplicates.  The read
+-- path must detect equal data_version/calc_time conflicts and fail closed,
+-- a replacing engine could erase that evidence during a background merge.
+ENGINE = MergeTree
 PARTITION BY toYYYYMM(trade_date)
 ORDER BY (factor_id, trade_date, security_id, factor_version_id, data_version);
 

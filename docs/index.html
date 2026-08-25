@@ -27,7 +27,7 @@
         <p class="eyebrow">A-share research data-engineering prototype</p>
         <h1>QData Free Source Quant Research Database</h1>
         <p class="hero-copy">
-          A prototype for auditable research contracts, PIT modeling where a knowledge cutoff is expressible, source governance, and SDK/API shapes. Public factor and adjustment-factor endpoints are latest-only; its public green path uses synthetic fixtures and database evidence is explicitly bounded.
+          A prototype for auditable research contracts, PIT modeling where a knowledge cutoff is expressible, source governance, and SDK/API shapes. Public factor and adjustment-factor endpoints are latest-only and admit only successful, finished, batch-bound, non-recalled dataset versions; its public green path uses synthetic fixtures and database evidence is explicitly bounded.
         </p>
         <div class="hero-actions">
           <a class="button primary" href="#proof">View verification</a>
@@ -91,7 +91,7 @@
             </div>
             <div class="pipe-step">
               <span class="number">4</span>
-              <div><b>Expose prototype surfaces</b><span>Python SDK, storage schemas, REST API and admin-console shapes with distinct evidence levels; unsupported factor/adjustment asof and vintage modes fail closed.</span></div>
+              <div><b>Expose prototype surfaces</b><span>Python SDK, storage schemas, REST API and admin-console shapes with distinct evidence levels; unsupported factor/adjustment asof and vintage modes, ambiguous ticker recycling, and retained factor-payload conflicts fail closed.</span></div>
               <span class="status">serve</span>
             </div>
           </div>
@@ -188,7 +188,7 @@ Use the current command output as evidence</code>
             The current version focuses on deterministic synthetic fixtures and explicit evidence boundaries. Free/public providers remain candidates until their legal, coverage and service constraints are reviewed.
           </p>
           <p>
-            The next technical milestone is broader real-database integration plus additional reference-arithmetic, PIT-screening and event-study contract examples.
+            The next technical milestone is broader real-database integration plus additional reference-arithmetic, PIT-screening and event-study contract examples. Existing factor rows already collapsed by an old ClickHouse sorting key remain recoverable only from retained source data or an earlier verified snapshot.
           </p>
           <div class="hero-actions">
             <a class="button primary" href="#system">Review architecture</a>

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import unittest
 from unittest.mock import patch
@@ -22,6 +22,13 @@ class FakePostgres:
                 "version_status": "active", "batch_status": "success",
                 "valid_from": aware("2024-01-02T17:00:00+08:00"),
                 "finished_at": aware("2024-01-02T17:01:00+08:00"),
+            },
+            {
+                "dataset_code": "factor_value_daily", "data_version": 7101,
+                "version_code": "factor_value_daily:seed-v1", "batch_id": 20,
+                "version_status": "active", "batch_status": "success",
+                "valid_from": aware("2024-01-02T18:31:00+08:00"),
+                "finished_at": aware("2024-01-02T18:31:00+08:00"),
             }
         ]
         self.adjustment_factors = adjustment_factors if adjustment_factors is not None else [
@@ -30,6 +37,7 @@ class FakePostgres:
                 "factor_forward": 0.5, "factor_backward": 2.0,
                 "revision_id": 1, "batch_id": 2,
                 "dataset_code": "daily_bar", "batch_status": "success",
+                "version_status": "active",
                 "batch_finished_at": aware("2024-01-02T17:00:00+08:00"),
                 "announce_time": aware("2024-01-02T16:00:00+08:00"),
                 "effective_time": aware("2024-01-02T16:00:00+08:00"),
@@ -47,16 +55,40 @@ class FakePostgres:
     def fetch_all(self, sql, params=None):
         params = params or {}
         self.queries.append((sql, params))
+        if "qdata_requested_identity_range" in sql:
+            return [
+                {
+                    "requested_symbol": symbol,
+                    "security_id": 1000001,
+                }
+                for symbol in params["symbols"]
+            ]
+        if "qdata_security_identity_days" in sql:
+            start = datetime.strptime(params["start_date"], "%Y-%m-%d").date()
+            end = datetime.strptime(params["end_date"], "%Y-%m-%d").date()
+            rows = []
+            current = start
+            while current <= end:
+                rows.extend(
+                    {
+                        "security_id": security_id,
+                        "trade_date": current.isoformat(),
+                        "symbol": "600519.SH",
+                    }
+                    for security_id in params["security_ids"]
+                )
+                current += timedelta(days=1)
+            return rows
         if "FROM qmeta.security_master" in sql:
             return [{
                 "security_id": 1000001, "symbol": "600519.SH", "asset_type": "stock",
                 "exchange": "SH", "name": "贵州茅台", "list_date": "2001-08-27",
                 "delist_date": None, "status": "active", "currency": "CNY",
             }]
-        if "FROM qmeta.dataset_version" in sql:
-            return self._dataset_version_rows(sql, params)
         if "FROM qmeta.adjustment_factor" in sql:
             return self._adjustment_factor_rows(sql, params)
+        if "FROM qmeta.dataset_version" in sql:
+            return self._dataset_version_rows(sql, params)
         if "FROM qmeta.factor_definition" in sql:
             requested = set(params.get("factors") or [])
             version = params.get("factor_version")
@@ -96,6 +128,8 @@ class FakePostgres:
                 continue
             if "db.status = 'success'" in sql and item["batch_status"] != "success":
                 continue
+            if "db.finished_at IS NOT NULL" in sql and item["finished_at"] is None:
+                continue
             if (requested is not None and "requested_data_version" in sql
                     and str(requested) not in {str(item["data_version"]), item["version_code"]}):
                 continue
@@ -131,6 +165,11 @@ class FakePostgres:
                     and item["dataset_code"] not in knowledge_datasets):
                 continue
             if "db.status = 'success'" in sql and item["batch_status"] != "success":
+                continue
+            if (
+                "dv.status IN ('active', 'superseded')" in sql
+                and item.get("version_status") not in {"active", "superseded"}
+            ):
                 continue
             if cutoff is not None:
                 if ("db.finished_at IS NOT NULL" in sql
@@ -186,6 +225,29 @@ class FakePostgres:
         self.closed = True
 
 
+class RenameRangePostgres(FakePostgres):
+    def fetch_all(self, sql, params=None):
+        params = params or {}
+        if "qdata_requested_identity_range" in sql:
+            self.queries.append((sql, params))
+            return [{"security_id": 1000001}]
+        if "qdata_security_identity_days" in sql:
+            self.queries.append((sql, params))
+            return [
+                {
+                    "security_id": 1000001,
+                    "trade_date": "2024-01-02",
+                    "symbol": "OLD001.SH",
+                },
+                {
+                    "security_id": 1000001,
+                    "trade_date": "2024-01-03",
+                    "symbol": "NEW001.SH",
+                },
+            ]
+        return super().fetch_all(sql, params)
+
+
 class FakeClickHouse:
     def __init__(self, daily_rows=None, factor_rows=None) -> None:
         self.queries = []
@@ -199,6 +261,8 @@ class FakeClickHouse:
         self.factor_rows = factor_rows if factor_rows is not None else [{
             "factor_id": 101, "factor_version_id": 1001, "security_id": 1000001,
             "trade_date": "2024-01-02", "factor_value": 0.75, "quality_flag": "normal",
+            "data_version": 7101,
+            "calc_time": aware("2024-01-02T18:30:00+08:00"),
         }]
 
     def fetch_all(self, sql, params=None):
@@ -207,7 +271,7 @@ class FakeClickHouse:
         if "FROM qts.daily_bar" in sql:
             return self._price_rows(params)
         if "FROM qts.factor_value_daily" in sql:
-            return self._factor_rows(params)
+            return self._factor_rows(sql, params)
         return []
 
     def _price_rows(self, params):
@@ -238,7 +302,7 @@ class FakeClickHouse:
                 latest[key] = row
         return list(latest.values())
 
-    def _factor_rows(self, params):
+    def _factor_rows(self, sql, params):
         exact_pairs = set()
         index = 0
         while f"factor_pair_{index}_factor_id" in params:
@@ -247,6 +311,7 @@ class FakeClickHouse:
             index += 1
         factor_ids = set(params.get("factor_ids") or [])
         version_ids = set(params.get("factor_version_ids") or [])
+        allowed_data_versions = set(params.get("allowed_data_versions") or [])
         rows = []
         for row in self.factor_rows:
             pair = (row["factor_id"], row["factor_version_id"])
@@ -254,7 +319,63 @@ class FakeClickHouse:
                 continue
             if not exact_pairs and (pair[0] not in factor_ids or pair[1] not in version_ids):
                 continue
+            if allowed_data_versions and row.get("data_version") not in allowed_data_versions:
+                continue
+            if row["security_id"] not in set(params.get("security_ids") or []):
+                continue
+            if not params["start_date"] <= row["trade_date"] <= params["end_date"]:
+                continue
             rows.append(dict(row))
+        if "_qdata_conflict_count" in sql:
+            payloads = {}
+            for row in rows:
+                key = (
+                    row["factor_id"],
+                    row["factor_version_id"],
+                    row["security_id"],
+                    row["trade_date"],
+                    row["data_version"],
+                    row["calc_time"],
+                )
+                payloads.setdefault(key, set()).add(
+                    (
+                        row.get("factor_value"),
+                        row.get("quality_flag"),
+                        row.get("universe_id"),
+                    )
+                )
+            for row in rows:
+                key = (
+                    row["factor_id"],
+                    row["factor_version_id"],
+                    row["security_id"],
+                    row["trade_date"],
+                    row["data_version"],
+                    row["calc_time"],
+                )
+                row["_qdata_conflict_count"] = len(payloads[key])
+        if "_qdata_revision_rank = 1" in sql:
+            latest = {}
+            for row in rows:
+                key = (
+                    row["factor_id"],
+                    row["factor_version_id"],
+                    row["security_id"],
+                    row["trade_date"],
+                )
+                ordering = (
+                    row.get("data_version", -1),
+                    row.get("calc_time"),
+                    float("-inf")
+                    if row.get("factor_value") is None
+                    else row["factor_value"],
+                    row.get("quality_flag") or "",
+                    -1 if row.get("universe_id") is None else row["universe_id"],
+                )
+                previous = latest.get(key)
+                if previous is None or ordering > previous[0]:
+                    latest[key] = (ordering, row)
+            rows = [item[1] for item in latest.values()]
         return rows
 
     def close(self):
@@ -511,6 +632,207 @@ class SqlBackendTest(unittest.TestCase):
         self.assertIn("factor_pair_1_factor_id", params)
         self.assertIn("factor_id = %(factor_pair_0_factor_id)s", sql)
 
+    def test_factor_latest_admits_only_successful_published_dataset_versions(self) -> None:
+        versions = [
+            {
+                "dataset_code": "factor_value_daily",
+                "data_version": 7101,
+                "version_code": "factor_value_daily:published",
+                "batch_id": 21,
+                "version_status": "active",
+                "batch_status": "success",
+                "valid_from": aware("2024-01-02T18:30:00+08:00"),
+                "finished_at": aware("2024-01-02T18:31:00+08:00"),
+            },
+            {
+                "dataset_code": "factor_value_daily",
+                "data_version": 7102,
+                "version_code": "factor_value_daily:recalled",
+                "batch_id": 22,
+                "version_status": "recalled",
+                "batch_status": "success",
+                "valid_from": aware("2024-01-02T18:32:00+08:00"),
+                "finished_at": aware("2024-01-02T18:33:00+08:00"),
+            },
+            {
+                "dataset_code": "factor_value_daily",
+                "data_version": 7103,
+                "version_code": "factor_value_daily:failed",
+                "batch_id": 23,
+                "version_status": "active",
+                "batch_status": "failed",
+                "valid_from": aware("2024-01-02T18:34:00+08:00"),
+                "finished_at": aware("2024-01-02T18:35:00+08:00"),
+            },
+            {
+                "dataset_code": "factor_value_daily",
+                "data_version": 7104,
+                "version_code": "factor_value_daily:running",
+                "batch_id": 24,
+                "version_status": "active",
+                "batch_status": "running",
+                "valid_from": aware("2024-01-02T18:36:00+08:00"),
+                "finished_at": None,
+            },
+        ]
+        factor_rows = [
+            {
+                **self._factor_value(101, 1001, value),
+                "data_version": version,
+                "calc_time": aware(f"2024-01-02T{hour}:00+08:00"),
+            }
+            for version, value, hour in (
+                (7101, 1.0, "18:30"),
+                (7102, 9999.0, "18:32"),
+                (7103, 8888.0, "18:34"),
+                (7104, 7777.0, "18:36"),
+                (9999, 6666.0, "18:38"),
+            )
+        ]
+        postgres = FakePostgres(dataset_versions=versions)
+        clickhouse = FakeClickHouse(factor_rows=factor_rows)
+
+        rows = self._client(postgres, clickhouse).get_factor(
+            factors=["momentum_20d"],
+            symbols=["600519.SH"],
+            start_date="2024-01-02",
+            end_date="2024-01-02",
+        )
+
+        self.assertEqual([row["factor_value"] for row in rows], [1.0])
+        factor_sql, factor_params = clickhouse.queries[-1]
+        self.assertIn("data_version IN %(allowed_data_versions)s", factor_sql)
+        self.assertEqual(factor_params["allowed_data_versions"], (7101,))
+
+    def test_factor_latest_fails_closed_on_equal_version_and_calc_time_conflict(self) -> None:
+        conflict_time = aware("2024-01-02T18:30:00+08:00")
+        rows = [
+            {
+                **self._factor_value(101, 1001, value),
+                "data_version": 7101,
+                "calc_time": conflict_time,
+            }
+            for value in (1.0, 2.0)
+        ]
+        client = self._client(FakePostgres(), FakeClickHouse(factor_rows=rows))
+
+        with self.assertRaisesRegex(QDataValidationError, "conflicting factor rows"):
+            client.get_factor(
+                factors=["momentum_20d"],
+                symbols=["600519.SH"],
+                start_date="2024-01-02",
+                end_date="2024-01-02",
+            )
+
+    def test_factor_latest_collapses_identical_retry_rows(self) -> None:
+        retry_time = aware("2024-01-02T18:30:00+08:00")
+        row = {
+            **self._factor_value(101, 1001, 1.0),
+            "data_version": 7101,
+            "calc_time": retry_time,
+        }
+        client = self._client(
+            FakePostgres(),
+            FakeClickHouse(factor_rows=[dict(row), dict(row)]),
+        )
+
+        rows = client.get_factor(
+            factors=["momentum_20d"],
+            symbols=["600519.SH"],
+            start_date="2024-01-02",
+            end_date="2024-01-02",
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["factor_value"], 1.0)
+
+    def test_recalled_adjustment_revision_cannot_override_active_revision(self) -> None:
+        active = self._factor_revision(1, 2, 0.5, "17:00")
+        recalled = self._factor_revision(
+            2,
+            3,
+            0.1,
+            "18:00",
+            dataset_code="adjustment_factor",
+            version_status="recalled",
+        )
+        postgres = FakePostgres(adjustment_factors=[active, recalled])
+        client = self._client(postgres, FakeClickHouse())
+
+        factors = client.get_adjustment_factor(
+            symbols=["600519.SH"],
+            start_date="2024-01-02",
+            end_date="2024-01-02",
+            factor_type="forward",
+        )
+        prices = client.get_price(
+            symbols=["600519.SH"],
+            start_date="2024-01-02",
+            end_date="2024-01-02",
+            adjust="forward",
+        )
+
+        self.assertEqual(factors[0]["factor_forward"], 0.5)
+        self.assertEqual(prices[0]["close"], 5.25)
+        adjustment_sql = [
+            sql for sql, _ in postgres.queries if "FROM qmeta.adjustment_factor" in sql
+        ]
+        self.assertTrue(adjustment_sql)
+        for sql in adjustment_sql:
+            self.assertIn("qmeta.dataset_version", sql)
+            self.assertIn("dv.status IN ('active', 'superseded')", sql)
+
+    def test_range_queries_label_price_adjustment_and_factor_with_each_days_ticker(self) -> None:
+        adjustments = []
+        for trade_date, value in (("2024-01-02", 0.5), ("2024-01-03", 0.4)):
+            row = self._factor_revision(1, 2, value, "17:00")
+            row["trade_date"] = trade_date
+            adjustments.append(row)
+        postgres = RenameRangePostgres(adjustment_factors=adjustments)
+        daily_rows = []
+        factor_rows = []
+        for trade_date, close, value in (
+            ("2024-01-02", 10.0, 1.0),
+            ("2024-01-03", 11.0, 2.0),
+        ):
+            daily = self._price(7001, close, "17:00")
+            daily["trade_date"] = trade_date
+            daily_rows.append(daily)
+            factor = self._factor_value(101, 1001, value)
+            factor["trade_date"] = trade_date
+            factor_rows.append(factor)
+        clickhouse = FakeClickHouse(daily_rows=daily_rows, factor_rows=factor_rows)
+        client = self._client(postgres, clickhouse)
+
+        price_rows = client.get_price(
+            symbols=["OLD001.SH"],
+            start_date="2024-01-02",
+            end_date="2024-01-03",
+        )
+        adjustment_rows = client.get_adjustment_factor(
+            symbols=["OLD001.SH"],
+            start_date="2024-01-02",
+            end_date="2024-01-03",
+        )
+        factor_result = client.get_factor(
+            factors=["momentum_20d"],
+            symbols=["OLD001.SH"],
+            start_date="2024-01-02",
+            end_date="2024-01-03",
+        )
+
+        expected = ["OLD001.SH", "NEW001.SH"]
+        self.assertEqual([row["symbol"] for row in price_rows], expected)
+        self.assertEqual([row["symbol"] for row in adjustment_rows], expected)
+        self.assertEqual([row["symbol"] for row in factor_result], expected)
+
+        by_id = client.get_price(
+            security_ids=[1000001],
+            start_date="2024-01-02",
+            end_date="2024-01-03",
+        )
+        self.assertEqual([row["symbol"] for row in by_id], expected)
+
     def test_sql_backend_get_fundamental_asof(self) -> None:
         client = Client(backend="sql", postgres_client=FakePostgres(), default_format="records")
         rows = client.get_fundamental_asof(symbols=["600519.SH"], fields=["roe_ttm"], asof_date="2021-06-30")
@@ -552,12 +874,14 @@ class SqlBackendTest(unittest.TestCase):
     def _factor_revision(
         revision_id, batch_id, factor_forward, time_text,
         dataset_code="daily_bar", batch_status="success", batch_finished_at=None,
+        version_status="active",
     ):
         timestamp = aware(f"2024-01-02T{time_text}:00+08:00")
         return {"security_id": 1000001, "trade_date": "2024-01-02",
                 "factor_forward": factor_forward, "factor_backward": 1 / factor_forward,
                 "revision_id": revision_id, "batch_id": batch_id,
                 "dataset_code": dataset_code, "batch_status": batch_status,
+                "version_status": version_status,
                 "batch_finished_at": batch_finished_at or timestamp,
                 "announce_time": timestamp, "effective_time": timestamp, "ingest_time": timestamp}
 
@@ -565,7 +889,9 @@ class SqlBackendTest(unittest.TestCase):
     def _factor_value(factor_id, factor_version_id, value):
         return {"factor_id": factor_id, "factor_version_id": factor_version_id,
                 "security_id": 1000001, "trade_date": "2024-01-02",
-                "factor_value": value, "quality_flag": "normal"}
+                "factor_value": value, "quality_flag": "normal",
+                "data_version": 7101,
+                "calc_time": aware("2024-01-02T18:30:00+08:00")}
 
 
 if __name__ == "__main__":

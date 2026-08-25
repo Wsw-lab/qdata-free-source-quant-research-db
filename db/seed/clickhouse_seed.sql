@@ -23,10 +23,10 @@ INSERT INTO qts.factor_value_daily (
     factor_id, factor_version_id, security_id, trade_date, factor_value, universe_id,
     calc_time, data_version, quality_flag
 ) VALUES
-    (1, 1, 1000001, '2024-01-02', 0.032, 800, '2024-01-02 18:30:00.000', 2, 'normal'),
-    (1, 1, 1000002, '2024-01-02', -0.011, 800, '2024-01-02 18:30:00.000', 2, 'normal'),
-    (2, 2, 1000001, '2024-01-02', 0.283, 800, '2024-01-02 18:30:00.000', 3, 'normal'),
-    (2, 2, 1000002, '2024-01-02', 0.104, 800, '2024-01-02 18:30:00.000', 3, 'normal');
+    (1, 1, 1000001, '2024-01-02', 0.032, 800, '2024-01-02 18:30:00.000', 13, 'normal'),
+    (1, 1, 1000002, '2024-01-02', -0.011, 800, '2024-01-02 18:30:00.000', 13, 'normal'),
+    (2, 2, 1000001, '2024-01-02', 0.283, 800, '2024-01-02 18:30:00.000', 14, 'normal'),
+    (2, 2, 1000002, '2024-01-02', 0.104, 800, '2024-01-02 18:30:00.000', 14, 'normal');
 
 INSERT INTO qts.factor_quality_daily (
     factor_id, factor_version_id, trade_date, universe_id, coverage_rate, missing_rate,

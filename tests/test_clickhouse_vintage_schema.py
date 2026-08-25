@@ -14,6 +14,9 @@ VINTAGE_MIGRATION = ROOT / "db" / "migrations" / "0056_clickhouse_durable_vintag
 FACTOR_VINTAGE_MIGRATION = (
     ROOT / "db" / "migrations" / "0057_clickhouse_factor_durable_vintage.sql"
 )
+FACTOR_CONFLICT_MIGRATION = (
+    ROOT / "db" / "migrations" / "0062_clickhouse_factor_conflict_preservation.sql"
+)
 
 
 def _table_block(sql: str, table: str) -> str:
@@ -92,17 +95,39 @@ class ClickHouseVintageSchemaContractTest(unittest.TestCase):
         ]
         for ddl_path in (INIT_DDL, COMBINED_DDL):
             with self.subTest(ddl=ddl_path.name):
-                key = _order_key(
-                    _table_block(
-                        ddl_path.read_text(encoding="utf-8"),
-                        "qts.factor_value_daily",
-                    )
+                block = _table_block(
+                    ddl_path.read_text(encoding="utf-8"),
+                    "qts.factor_value_daily",
                 )
+                self.assertRegex(block, r"ENGINE\s*=\s*MergeTree\b")
+                self.assertNotRegex(block, r"ENGINE\s*=\s*ReplacingMergeTree")
+                key = _order_key(block)
                 merged = _merged_rows(rows, key)
                 self.assertEqual(
                     sorted(row["data_version"] for row in merged),
                     [7001, 7002],
                 )
+
+    def test_factor_conflicts_have_forward_only_preservation_migration(self) -> None:
+        self.assertTrue(
+            FACTOR_CONFLICT_MIGRATION.is_file(),
+            "a forward-only factor conflict-preservation migration is required",
+        )
+        sql = FACTOR_CONFLICT_MIGRATION.read_text(encoding="utf-8")
+        required = (
+            "SYSTEM STOP MERGES qts.factor_value_daily;",
+            "CREATE TABLE qts.factor_value_daily__0062_rebuild",
+            "ENGINE = MergeTree",
+            "ORDER BY (factor_id, trade_date, security_id, factor_version_id, data_version)",
+            "INSERT INTO qts.factor_value_daily__0062_rebuild",
+            "FROM qts.factor_value_daily",
+            "EXCHANGE TABLES qts.factor_value_daily AND qts.factor_value_daily__0062_rebuild;",
+            "SYSTEM STOP MERGES qts.factor_value_daily__0062_rebuild;",
+            "SYSTEM START MERGES qts.factor_value_daily;",
+        )
+        for statement in required:
+            with self.subTest(statement=statement):
+                self.assertIn(statement, sql)
 
     def test_existing_factor_table_has_forward_only_vintage_migration(self) -> None:
         self.assertTrue(
@@ -334,6 +359,129 @@ class ClickHouseVintageMigrationIntegrationTest(unittest.TestCase):
                 """
             ).result_rows
             self.assertEqual(retained, [(7001, 0.11), (7002, 0.2)])
+        finally:
+            for target in cleanup:
+                client.command(f"DROP TABLE IF EXISTS {target} SYNC")
+            client.close()
+
+    def test_factor_conflicts_survive_0062_migration_and_optimize_final(self) -> None:
+        try:
+            import clickhouse_connect
+        except ImportError as exc:
+            self.fail(f"clickhouse-connect is required: {exc}")
+
+        dsn = os.getenv(
+            "QDATA_CLICKHOUSE_DSN",
+            "http://qdata:qdata@127.0.0.1:18123/default",
+        )
+        client = clickhouse_connect.get_client(dsn=dsn)
+        shanghai = ZoneInfo("Asia/Shanghai")
+        trade_day = date(2024, 1, 2)
+        calc_at = datetime(2024, 1, 2, 18, 0, tzinfo=shanghai)
+        table = f"qdata_factor_conflict_{uuid4().hex[:10]}"
+        qualified = f"default.{table}"
+        fixture_qualified = f"{qualified}__fixture_source"
+        rebuild_qualified = f"{qualified}__0062_rebuild"
+        cleanup = [qualified, fixture_qualified, rebuild_qualified]
+        try:
+            fresh_ddl = _table_block(
+                INIT_DDL.read_text(encoding="utf-8"),
+                "qts.factor_value_daily",
+            )
+            source_ddl = fresh_ddl.replace(
+                "CREATE TABLE IF NOT EXISTS qts.factor_value_daily",
+                f"CREATE TABLE {qualified}",
+                1,
+            ).replace(
+                "ENGINE = MergeTree",
+                "ENGINE = ReplacingMergeTree(calc_time)",
+                1,
+            )
+            client.command(source_ddl.rstrip(";"))
+            fixture_ddl = source_ddl.replace(
+                f"CREATE TABLE {qualified}",
+                f"CREATE TABLE {fixture_qualified}",
+                1,
+            ).replace(
+                "ENGINE = ReplacingMergeTree(calc_time)",
+                "ENGINE = MergeTree",
+                1,
+            )
+            client.command(fixture_ddl.rstrip(";"))
+
+            columns = [
+                "factor_id",
+                "factor_version_id",
+                "security_id",
+                "trade_date",
+                "factor_value",
+                "data_version",
+                "calc_time",
+            ]
+            conflicting_rows = [
+                [1, 11, 101, trade_day, 0.10, 7001, calc_at],
+                [1, 11, 101, trade_day, 0.11, 7001, calc_at],
+                [1, 11, 101, trade_day, 0.20, 7002, calc_at],
+            ]
+            client.insert(
+                fixture_qualified,
+                conflicting_rows,
+                column_names=columns,
+            )
+            client.command(
+                f"ALTER TABLE {qualified} ATTACH PARTITION 202401 "
+                f"FROM {fixture_qualified}"
+            )
+
+            rendered = FACTOR_CONFLICT_MIGRATION.read_text(
+                encoding="utf-8"
+            ).replace("qts.factor_value_daily", qualified)
+            executable_sql = "\n".join(
+                line for line in rendered.splitlines()
+                if not line.lstrip().startswith("--")
+            )
+            for statement in executable_sql.split(";"):
+                if statement.strip():
+                    client.command(statement)
+
+            engines = client.query(
+                f"""
+                SELECT name, engine
+                FROM system.tables
+                WHERE database = 'default'
+                  AND name IN ('{table}', '{table}__0062_rebuild')
+                ORDER BY name
+                """
+            ).result_rows
+            self.assertEqual(
+                engines,
+                [
+                    (table, "MergeTree"),
+                    (f"{table}__0062_rebuild", "ReplacingMergeTree"),
+                ],
+            )
+
+            # Force a real merge after migration. Plain MergeTree must retain
+            # both exact data_version/calc_time conflicts for fail-closed reads.
+            client.insert(
+                qualified,
+                [[2, 11, 101, trade_day, 9.9, 9999, calc_at]],
+                column_names=columns,
+            )
+            client.command(f"OPTIMIZE TABLE {qualified} FINAL")
+            retained = client.query(
+                f"""
+                SELECT data_version, factor_value, calc_time
+                FROM {qualified}
+                WHERE factor_id = 1 AND security_id = 101
+                ORDER BY data_version, factor_value
+                """
+            ).result_rows
+            self.assertEqual(
+                [(row[0], row[1]) for row in retained],
+                [(7001, 0.10), (7001, 0.11), (7002, 0.20)],
+            )
+            self.assertTrue(all(row[2] == retained[0][2] for row in retained))
         finally:
             for target in cleanup:
                 client.command(f"DROP TABLE IF EXISTS {target} SYNC")

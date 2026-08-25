@@ -4,7 +4,9 @@
 
 本文用于定义 A 股量化数据底座 MVP 核心数据集的字段含义、数据来源、更新频率、单位、时间口径、空值含义和待确认事项。
 
-本文件与 `core-data-model-ddl.sql` 配套使用。DDL 定义存储结构，本文定义业务口径。
+存储结构以 `db/migrations/0001_postgresql_init.sql`（PostgreSQL）和
+`db/migrations/0002_clickhouse_init.sql`（ClickHouse）为 canonical fresh-install
+定义；已有环境只应用对应数据库的后续版本化迁移。本文定义业务口径，不作为可执行 DDL。
 
 ## 2. 通用字段口径
 
@@ -262,6 +264,9 @@
 
 结果可写入 `qpit.universe_member_pit`，默认 `universe_code=tradable_a_share`。
 
+`qmeta.universe_definition.universe_type` 决定 PIT 成员选择语义，创建后不可原地修改。
+需要改变类型时应创建新的 universe 定义并重新发布成员历史，避免旧快照被重新解释。
+
 ### `matrix_export_audit`
 
 | 字段名 | 中文含义 | 更新频率 | 口径 | 样例 |
@@ -434,6 +439,10 @@ MVP 第一批事件：
 | `factor_value` | 因子值 | 计算任务 | 日级 | 原始值，不默认标准化 | `0.1234` |
 | `universe_id` | 股票池 ID | 计算任务 | 日级 | 可为空，表示全市场 | `300001` |
 | `calc_time` | 计算时间 | 系统 | 计算时 | 因子值生成时间 | `2026-07-23 18:00:00` |
+
+`factor_value_daily` 使用普通 `MergeTree` 保存冲突证据。同一因子、证券、交易日、
+因子版本、`data_version` 与 `calc_time` 若出现多条记录，存储层不得静默去重；查询层必须
+将其判为不可确定并 fail closed。正常重算应发布新的可追溯数据版本，而不是依赖后台合并覆盖。
 
 待确认：
 

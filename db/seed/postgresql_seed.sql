@@ -57,7 +57,9 @@ INSERT INTO qmeta.data_batch (
     (9, 10, 2, 'seed-industry-membership-20211213', '2021-12-13', '2021-12-10', '2021-12-10 17:59:00+08', '2021-12-10 18:01:00+08', 'success', 'seed://industry_membership_pit/2021-12-13', 3),
     (10, 12, 2, 'seed-universe-member-20240102', '2024-01-02', '2024-01-02', '2024-01-02 17:59:00+08', '2024-01-02 18:01:00+08', 'success', 'seed://universe_member_pit/2024-01-02', 2),
     (11, 6, 2, 'seed-limit-price-20240102', '2024-01-02', '2024-01-02', '2024-01-02 17:59:00+08', '2024-01-02 18:01:00+08', 'success', 'seed://limit_price_daily/2024-01-02', 3),
-    (12, 6, 2, 'seed-limit-price-20240103', '2024-01-03', '2024-01-03', '2024-01-03 17:59:00+08', '2024-01-03 18:01:00+08', 'success', 'seed://limit_price_daily/2024-01-03', 2)
+    (12, 6, 2, 'seed-limit-price-20240103', '2024-01-03', '2024-01-03', '2024-01-03 17:59:00+08', '2024-01-03 18:01:00+08', 'success', 'seed://limit_price_daily/2024-01-03', 2),
+    (13, 11, 2, 'seed-factor-momentum-20240102', '2024-01-02', '2024-01-02', '2024-01-02 18:29:00+08', '2024-01-02 18:31:00+08', 'success', 'seed://factor_value_daily/momentum_20d/2024-01-02', 2),
+    (14, 11, 2, 'seed-factor-roe-20240102', '2024-01-02', '2024-01-02', '2024-01-02 18:29:00+08', '2024-01-02 18:31:00+08', 'success', 'seed://factor_value_daily/roe_ttm/2024-01-02', 2)
 ON CONFLICT (batch_code) DO UPDATE SET
     dataset_id = EXCLUDED.dataset_id,
     source_id = EXCLUDED.source_id,
@@ -83,7 +85,9 @@ INSERT INTO qmeta.dataset_version (
     (9, 10, 'industry_membership_pit:seed-v1', 9, '2021-12-10 18:01:00+08', 'active', '本地 smoke 行业分类版本'),
     (10, 12, 'universe_member_pit:seed-v1', 10, '2024-01-02 18:01:00+08', 'active', '本地 smoke 股票池成员版本'),
     (11, 6, 'limit_price_daily:seed-20240102-v1', 11, '2024-01-02 18:01:00+08', 'superseded', '本地 smoke 交易约束 2024-01-02 版本'),
-    (12, 6, 'limit_price_daily:seed-20240103-v1', 12, '2024-01-03 18:01:00+08', 'active', '本地 smoke 交易约束 2024-01-03 版本')
+    (12, 6, 'limit_price_daily:seed-20240103-v1', 12, '2024-01-03 18:01:00+08', 'active', '本地 smoke 交易约束 2024-01-03 版本'),
+    (13, 11, 'factor_value_daily:momentum-20240102-v1', 13, '2024-01-02 18:31:00+08', 'active', '本地 smoke 动量因子值版本'),
+    (14, 11, 'factor_value_daily:roe-20240102-v1', 14, '2024-01-02 18:31:00+08', 'active', '本地 smoke ROE 因子值版本')
 ON CONFLICT (version_code) DO UPDATE SET
     dataset_id = EXCLUDED.dataset_id,
     batch_id = EXCLUDED.batch_id,

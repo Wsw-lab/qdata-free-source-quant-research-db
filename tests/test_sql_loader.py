@@ -34,6 +34,7 @@ class StatefulConnection:
         self.security_identifier_row = None
         self.security_name_row = None
         self.security_status_row = None
+        self.occupied_symbol_security_id = None
         self.universe_definition_type = "rule_based"
         self.fail_commit_numbers = set()
         self.fail_sql_token = None
@@ -125,6 +126,13 @@ class StatefulCursor:
                 "current_status": params.get("current_status") or "unknown",
             }
             self.rowcount = 1
+        elif (
+            normalized.startswith("select security_id as target_security_id")
+            and "from qmeta.security_master" in normalized
+        ):
+            owner = self.connection.occupied_symbol_security_id
+            self._one = {"target_security_id": owner} if owner is not None else None
+            self.rowcount = int(self._one is not None)
         elif normalized.startswith("select st.status, st.start_date, st.end_date") \
                 and "from qmeta.security_status_history" in normalized:
             self._one = self.connection.security_status_row
@@ -380,6 +388,45 @@ class SqlDailyBundleLoaderTest(unittest.TestCase):
             ("New Name", "2024-02-05", None),
         )
 
+    def test_stable_id_rename_fails_before_batch_when_target_symbol_is_owned_elsewhere(self) -> None:
+        connection = StatefulConnection()
+        connection.occupied_symbol_security_id = 2000002
+        connection.security_master_row = {
+            "security_id": 1000001,
+            "list_date": "2020-01-01",
+            "delist_date": None,
+            "current_name": "New Name",
+            "current_status": "active",
+        }
+        loader = self._loader(connection, FakeClickHouse())
+
+        with self.assertRaisesRegex(
+            QDataValidationError,
+            "target symbol .* is already owned by security_id 2000002",
+        ):
+            loader.load_security_master(
+                [
+                    SecurityRecord(
+                        "NEW001.SH",
+                        "New Name",
+                        list_date="2020-01-01",
+                        status="active",
+                        security_id=1000001,
+                        identifier_effective_date="2024-02-05",
+                        name_effective_date="2024-02-05",
+                    )
+                ]
+            )
+
+        self.assertFalse(
+            any(
+                "INSERT INTO qmeta.data_batch" in sql
+                or "INSERT INTO qmeta.security_master" in sql
+                or "INSERT INTO qmeta.security_identifier_history" in sql
+                for sql, _ in connection.executed
+            )
+        )
+
     def test_tradable_snapshot_rejects_existing_non_rule_based_definition(self) -> None:
         connection = StatefulConnection()
         connection.universe_definition_type = "manual"
@@ -593,15 +640,58 @@ class SqlDailyBundleLoaderTest(unittest.TestCase):
         )
         self.assertNotIn("ON CONFLICT", factor_sql)
 
+    def test_adjustment_ingest_publishes_a_batch_bound_dataset_version(self) -> None:
+        connection = StatefulConnection()
+        loader = self._loader(connection, FakeClickHouse())
+
+        loader.load_market_constraints(
+            [AdjustmentFactorRecord("600519.SH", "2024-01-04", 0.5, 2.0)],
+            [],
+            [],
+        )
+
+        self.assertEqual(connection.batch_status, {99: "success"})
+        self.assertEqual(connection.version_status, {7001: "active"})
+        self.assertEqual(connection.version_batch, {7001: 99})
+
+    def test_adjustment_version_is_recalled_when_sibling_constraint_write_fails(self) -> None:
+        connection = StatefulConnection()
+        connection.fail_sql_token = "insert into qmeta.limit_price_daily"
+        loader = self._loader(connection, FakeClickHouse())
+
+        with self.assertRaisesRegex(RuntimeError, "limit_price_daily"):
+            loader.load_market_constraints(
+                [AdjustmentFactorRecord("600519.SH", "2024-01-04", 0.5, 2.0)],
+                [LimitPriceRecord("600519.SH", "2024-01-04", 100.0, 80.0)],
+                [],
+            )
+
+        self.assertEqual(connection.batch_status, {99: "failed", 100: "failed"})
+        self.assertEqual(connection.version_status, {7001: "recalled"})
+
     def test_market_constraints_failure_marks_every_started_batch_failed(self) -> None:
         connection = StatefulConnection()
         connection.fail_sql_token = "insert into qmeta.limit_price_daily"
         loader = self._loader(connection, FakeClickHouse())
         terminal = []
-        ids = iter([91, 92])
+        ids = iter([92])
+        loader._create_versioned_batch = lambda *args: SimpleNamespace(
+            batch_id=91,
+            data_version=7001,
+            version_code="adjustment_factor:test",
+        )
         loader._create_batch = lambda *args: next(ids)
-        loader._finish_batches = lambda batch_ids, status, error_message=None: terminal.append(
-            (tuple(batch_ids), status, error_message)
+        loader._finish_market_constraint_batches = (
+            lambda versioned, batch_ids, status, error_message=None: terminal.append(
+                (
+                    tuple(
+                        ([versioned.batch_id] if versioned is not None else [])
+                        + list(batch_ids)
+                    ),
+                    status,
+                    error_message,
+                )
+            )
         )
 
         with self.assertRaisesRegex(RuntimeError, "limit_price_daily"):
@@ -617,11 +707,24 @@ class SqlDailyBundleLoaderTest(unittest.TestCase):
     def test_market_constraints_write_all_supported_record_types(self) -> None:
         connection = StatefulConnection()
         loader = self._loader(connection, FakeClickHouse())
-        ids = iter([91, 92, 93])
+        ids = iter([92, 93])
         terminal = []
+        loader._create_versioned_batch = lambda *args: SimpleNamespace(
+            batch_id=91,
+            data_version=7001,
+            version_code="adjustment_factor:test",
+        )
         loader._create_batch = lambda *args: next(ids)
-        loader._finish_batches = lambda batch_ids, status, error_message=None: terminal.append(
-            (tuple(batch_ids), status)
+        loader._finish_market_constraint_batches = (
+            lambda versioned, batch_ids, status, error_message=None: terminal.append(
+                (
+                    tuple(
+                        ([versioned.batch_id] if versioned is not None else [])
+                        + list(batch_ids)
+                    ),
+                    status,
+                )
+            )
         )
 
         loader.load_market_constraints(
@@ -644,7 +747,7 @@ class SqlDailyBundleLoaderTest(unittest.TestCase):
         loader = self._loader(connection, FakeClickHouse())
         ids = iter([91, 92, 93, 94])
         loader._create_batch = lambda *args: next(ids)
-        loader._finish_batches = lambda *args, **kwargs: None
+        loader._finish_market_constraint_batches = lambda *args, **kwargs: None
 
         for limit_up, suspension_end in (
             (100.0, "2024-01-04 15:00:00"),

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import unittest
 
@@ -21,6 +21,27 @@ class _ContractPostgres:
     def fetch_all(self, sql: str, params: dict | None = None) -> list[dict]:
         params = params or {}
         self.queries.append((sql, params))
+        if "qdata_requested_identity_range" in sql:
+            return [
+                {"requested_symbol": symbol, "security_id": 1}
+                for symbol in params["symbols"]
+            ]
+        if "qdata_security_identity_days" in sql:
+            start = datetime.strptime(params["start_date"], "%Y-%m-%d").date()
+            end = datetime.strptime(params["end_date"], "%Y-%m-%d").date()
+            rows = []
+            current = start
+            while current <= end:
+                rows.extend(
+                    {
+                        "security_id": security_id,
+                        "trade_date": current.isoformat(),
+                        "symbol": "OLD001.SH",
+                    }
+                    for security_id in params["security_ids"]
+                )
+                current += timedelta(days=1)
+            return rows
         if "FROM qmeta.security_master" in sql:
             historical = all(
                 token in sql
@@ -216,7 +237,7 @@ class _FactorClickHouse:
                 "trade_date": "2024-01-02",
                 "factor_value": 0.1,
                 "quality_flag": "normal",
-                "data_version": 7001,
+                "data_version": 7100,
                 "calc_time": aware("2024-01-02T17:00:00+08:00"),
             },
             {
@@ -226,7 +247,7 @@ class _FactorClickHouse:
                 "trade_date": "2024-01-02",
                 "factor_value": 0.2,
                 "quality_flag": "normal",
-                "data_version": 7002,
+                "data_version": 7101,
                 "calc_time": aware("2024-01-02T18:00:00+08:00"),
             },
         ]
@@ -326,6 +347,18 @@ class _SuspensionOnlyPostgres(_ContractPostgres):
 class _FactorPostgres(_ContractPostgres):
     def fetch_all(self, sql: str, params: dict | None = None) -> list[dict]:
         params = params or {}
+        if "FROM qmeta.dataset_version" in sql:
+            self.queries.append((sql, params))
+            return [
+                {
+                    "data_version": 7101,
+                    "version_code": "factor_value_daily:published-v1",
+                    "batch_id": 21,
+                    "status": "active",
+                    "valid_from": aware("2024-01-02T18:00:00+08:00"),
+                    "finished_at": aware("2024-01-02T18:01:00+08:00"),
+                }
+            ]
         if "FROM qmeta.factor_definition" in sql:
             self.queries.append((sql, params))
             return [
@@ -334,6 +367,112 @@ class _FactorPostgres(_ContractPostgres):
                     "factor_code": "momentum_20d",
                     "factor_version_id": 1001,
                     "version_code": "v1",
+                }
+            ]
+        return super().fetch_all(sql, params)
+
+
+class _OverlappingEpisodePostgres(_ContractPostgres):
+    def fetch_all(self, sql: str, params: dict | None = None) -> list[dict]:
+        params = params or {}
+        if "FROM qpit.index_member_pit" in sql:
+            self.queries.append((sql, params))
+            rows = [
+                {
+                    "index_code": "000300.SH",
+                    "symbol": "OLD001.SH",
+                    "security_id": 1,
+                    "effective_date": "2024-01-01",
+                    "end_date": None,
+                    "weight": 0.4,
+                },
+                {
+                    "index_code": "000300.SH",
+                    "symbol": "OLD001.SH",
+                    "security_id": 1,
+                    "effective_date": "2024-01-02",
+                    "end_date": None,
+                    "weight": 0.6,
+                },
+            ]
+            return rows[-1:] if "_qdata_episode_rank" in sql else rows
+        if "FROM qpit.industry_membership_pit" in sql:
+            self.queries.append((sql, params))
+            rows = [
+                {
+                    "symbol": "OLD001.SH",
+                    "security_id": 1,
+                    "industry_system": "sw",
+                    "level": 1,
+                    "industry_code": "801100",
+                    "industry_name": "Old episode",
+                    "effective_date": "2024-01-01",
+                    "end_date": None,
+                },
+                {
+                    "symbol": "OLD001.SH",
+                    "security_id": 1,
+                    "industry_system": "sw",
+                    "level": 1,
+                    "industry_code": "801120",
+                    "industry_name": "New episode",
+                    "effective_date": "2024-01-02",
+                    "end_date": None,
+                },
+            ]
+            return rows[-1:] if "_qdata_episode_rank" in sql else rows
+        if "FROM qpit.universe_member_pit" in sql:
+            self.queries.append((sql, params))
+            rows = [
+                {
+                    "universe": params["universe"],
+                    "symbol": "OLD001.SH",
+                    "security_id": 1,
+                    "asof_date": params["asof_date"],
+                    "weight": 0.4,
+                },
+                {
+                    "universe": params["universe"],
+                    "symbol": "OLD001.SH",
+                    "security_id": 1,
+                    "asof_date": params["asof_date"],
+                    "weight": 0.6,
+                },
+            ]
+            return rows[-1:] if "_qdata_episode_rank" in sql else rows
+        return super().fetch_all(sql, params)
+
+
+class _SuspensionStUniversePostgres(_ContractPostgres):
+    def fetch_all(self, sql: str, params: dict | None = None) -> list[dict]:
+        params = params or {}
+        if "FROM qpit.universe_member_pit" in sql:
+            self.queries.append((sql, params))
+            return [
+                {
+                    "universe": params["universe"],
+                    "symbol": "OLD001.SH",
+                    "security_id": 1,
+                    "asof_date": params["asof_date"],
+                    "weight": 1.0,
+                }
+            ]
+        if "FROM qmeta.limit_price_daily" in sql:
+            self.queries.append((sql, params))
+            status_driven_st = "st.status IN ('st', 'star_st')" in sql
+            unknown_without_limit = "CASE WHEN lp.security_id IS NULL" in sql
+            return [
+                {
+                    "security_id": 1,
+                    "symbol": "OLD001.SH",
+                    "trade_date": "2024-01-02",
+                    "limit_up": None,
+                    "limit_down": None,
+                    "is_st": status_driven_st,
+                    "is_new_listing": None if unknown_without_limit else False,
+                    "is_suspended": True,
+                    "is_delisting_period": False,
+                    "list_days": 100,
                 }
             ]
         return super().fetch_all(sql, params)
@@ -705,6 +844,175 @@ class FinalPitSemanticsTest(unittest.TestCase):
         )
 
         self.assertEqual(rows, [])
+
+    def test_all_daily_knowledge_cutoffs_are_explicitly_shanghai_aware(self) -> None:
+        postgres = _ContractPostgres()
+        client = Client(
+            backend="sql",
+            postgres_client=postgres,
+            default_format="records",
+        )
+
+        client.get_security_master(security_ids=[1], asof_date="2024-01-02")
+        client.get_fundamental_asof(
+            security_ids=[1], fields=["roe_ttm"], asof_date="2024-01-02"
+        )
+        client.get_index_members_asof("000300.SH", "2024-01-02")
+        client.get_industry_asof(
+            symbols=["OLD001.SH"],
+            industry_system="sw",
+            level=1,
+            asof_date="2024-01-02",
+        )
+        client.get_universe("cn_a", "2024-01-03")
+        client.get_trading_constraints(
+            symbols=["OLD001.SH"],
+            start_date="2024-01-02",
+            end_date="2024-01-02",
+        )
+
+        pit_sql = "\n".join(sql for sql, _ in postgres.queries)
+        self.assertNotIn("+ INTERVAL '1 day'", pit_sql)
+        self.assertGreaterEqual(
+            pit_sql.count("AT TIME ZONE 'Asia/Shanghai'"),
+            6,
+        )
+
+    def test_latest_effective_episode_wins_after_natural_revision_selection(self) -> None:
+        postgres = _OverlappingEpisodePostgres()
+        client = Client(
+            backend="sql",
+            postgres_client=postgres,
+            default_format="records",
+        )
+
+        index_rows = client.get_index_members_asof("000300.SH", "2024-01-03")
+        industry_rows = client.get_industry_asof(
+            symbols=["OLD001.SH"],
+            industry_system="sw",
+            level=1,
+            asof_date="2024-01-03",
+        )
+        universe_rows = client.get_universe(
+            "manual_overlap",
+            "2024-01-03",
+            include_weight=True,
+        )
+
+        self.assertEqual([row["effective_date"] for row in index_rows], ["2024-01-02"])
+        self.assertEqual(
+            [row["effective_date"] for row in industry_rows],
+            ["2024-01-02"],
+        )
+        self.assertEqual([row["weight"] for row in universe_rows], [0.6])
+
+    def test_suspension_only_constraints_use_pit_status_and_preserve_unknowns(self) -> None:
+        postgres = _SuspensionStUniversePostgres()
+        client = Client(
+            backend="sql",
+            postgres_client=postgres,
+            default_format="records",
+        )
+
+        constraints = client.get_trading_constraints(
+            symbols=["OLD001.SH"],
+            start_date="2024-01-02",
+            end_date="2024-01-02",
+        )
+        filtered = client.get_universe(
+            "st_suspension_only",
+            "2024-01-02",
+            filters={"exclude_st": True, "exclude_suspended": False},
+        )
+
+        self.assertTrue(constraints[0]["is_st"])
+        self.assertIsNone(constraints[0]["is_new_listing"])
+        self.assertEqual(filtered, [])
+
+    def test_unknown_constraint_fields_fail_closed_when_a_filter_requires_them(self) -> None:
+        postgres = _SuspensionStUniversePostgres()
+        client = Client(
+            backend="sql",
+            postgres_client=postgres,
+            default_format="records",
+        )
+
+        rows = client.get_universe(
+            "st_suspension_only",
+            "2024-01-02",
+            filters={"exclude_new_listing": True},
+        )
+
+        self.assertEqual(rows, [])
+
+    def test_universe_type_is_immutable_in_fresh_and_upgrade_schemas(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        for ddl in (
+            root / "db" / "migrations" / "0001_postgresql_init.sql",
+            root / "db" / "table.sql",
+        ):
+            with self.subTest(ddl=ddl.name):
+                sql = ddl.read_text(encoding="utf-8")
+                self.assertIn("qmeta.reject_universe_type_change", sql)
+                self.assertIn("BEFORE UPDATE OF universe_type", sql)
+        migration = root / "db" / "migrations" / "0061_postgresql_universe_type_immutable.sql"
+        self.assertTrue(migration.is_file())
+        self.assertIn(
+            "BEFORE UPDATE OF universe_type",
+            migration.read_text(encoding="utf-8"),
+        )
+
+    def test_schema_entrypoints_name_canonical_sources_and_cover_latest_upgrades(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        legacy = (root / "core-data-model-ddl.sql").read_text(encoding="utf-8")
+        definition = (root / "data-definition.md").read_text(encoding="utf-8")
+        plan = (root / "db" / "db-plan.md").read_text(encoding="utf-8")
+        update = (root / "db" / "update.sql").read_text(encoding="utf-8")
+
+        self.assertIn("DEPRECATED", legacy[:1000])
+        self.assertNotIn("CREATE TABLE", legacy)
+        self.assertIn("db/migrations/0001_postgresql_init.sql", definition)
+        self.assertIn("db/migrations/0002_clickhouse_init.sql", definition)
+        self.assertNotIn("与 `core-data-model-ddl.sql` 配套使用", definition)
+        self.assertIn("canonical", plan.lower())
+        for migration in (
+            "0056_clickhouse_durable_vintage.sql",
+            "0057_clickhouse_factor_durable_vintage.sql",
+            "0058_postgresql_universe_snapshot.sql",
+            "0059_postgresql_security_history_lineage.sql",
+            "0060_postgresql_industry_category_history.sql",
+            "0061_postgresql_universe_type_immutable.sql",
+            "0062_clickhouse_factor_conflict_preservation.sql",
+        ):
+            with self.subTest(migration=migration):
+                self.assertIn(migration, update)
+
+    def test_factor_storage_preserves_equal_timestamp_conflicts_for_fail_closed_query(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        for ddl in (
+            root / "db" / "migrations" / "0002_clickhouse_init.sql",
+            root / "db" / "table.sql",
+        ):
+            sql = ddl.read_text(encoding="utf-8")
+            block = sql.split(
+                "CREATE TABLE IF NOT EXISTS qts.factor_value_daily",
+                1,
+            )[1].split(";", 1)[0]
+            with self.subTest(ddl=ddl.name):
+                self.assertIn("ENGINE = MergeTree", block)
+                self.assertNotIn("ENGINE = ReplacingMergeTree", block)
+                self.assertIn("data_version", block.split("ORDER BY", 1)[1])
+
+        migration = (
+            root
+            / "db"
+            / "migrations"
+            / "0062_clickhouse_factor_conflict_preservation.sql"
+        )
+        self.assertTrue(migration.is_file())
+        migration_sql = migration.read_text(encoding="utf-8")
+        self.assertIn("ENGINE = MergeTree", migration_sql)
+        self.assertIn("EXCHANGE TABLES", migration_sql)
 
 
 if __name__ == "__main__":

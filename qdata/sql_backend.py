@@ -161,11 +161,11 @@ class SqlBackend:
                           AND db_identifier.status = 'success'
                           AND db_identifier.finished_at IS NOT NULL
                           AND db_identifier.finished_at <
-                              (%(asof_date)s::date + INTERVAL '1 day')
+                              ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                           AND sih.announce_time <
-                              (%(asof_date)s::date + INTERVAL '1 day')
+                              ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                           AND sih.ingest_time <
-                              (%(asof_date)s::date + INTERVAL '1 day')
+                              ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                     ) identifier_revision
                     WHERE identifier_revision.revision_rank = 1
                       AND (identifier_revision.end_date IS NULL
@@ -197,11 +197,11 @@ class SqlBackend:
                           AND db_name.status = 'success'
                           AND db_name.finished_at IS NOT NULL
                           AND db_name.finished_at <
-                              (%(asof_date)s::date + INTERVAL '1 day')
+                              ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                           AND snh.announce_time <
-                              (%(asof_date)s::date + INTERVAL '1 day')
+                              ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                           AND snh.ingest_time <
-                              (%(asof_date)s::date + INTERVAL '1 day')
+                              ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                     ) name_revision
                     WHERE name_revision.revision_rank = 1
                       AND (name_revision.end_date IS NULL
@@ -233,11 +233,11 @@ class SqlBackend:
                           AND db_status.status = 'success'
                           AND db_status.finished_at IS NOT NULL
                           AND db_status.finished_at <
-                              (%(asof_date)s::date + INTERVAL '1 day')
+                              ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                           AND ssh.announce_time <
-                              (%(asof_date)s::date + INTERVAL '1 day')
+                              ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                           AND ssh.ingest_time <
-                              (%(asof_date)s::date + INTERVAL '1 day')
+                              ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                     ) status_revision
                     WHERE status_revision.revision_rank = 1
                       AND (status_revision.end_date IS NULL
@@ -325,7 +325,15 @@ class SqlBackend:
             )
         cutoff = self._validate_price_mode(query_mode, asof_time, data_version)
 
-        security_map = self._resolve_security_map(symbols, security_ids, universe, asof_date=end_date)
+        resolved_security_ids, identity_by_day = (
+            self._resolve_security_identities_over_range(
+                symbols,
+                security_ids,
+                universe,
+                start_date,
+                end_date,
+            )
+        )
         requested_fields = fields or ["open", "high", "low", "close", "volume", "amount"]
         allowed_fields = self.PRICE_FIELDS if frequency == "1d" else self.MINUTE_FIELDS
         self._validate_fields(requested_fields, allowed_fields, "fields")
@@ -349,7 +357,7 @@ class SqlBackend:
             "data_version IN %(allowed_data_versions)s",
         ]
         params: dict[str, Any] = {
-            "security_ids": tuple(security_map),
+            "security_ids": tuple(resolved_security_ids),
             "start_date": start_date,
             "end_date": end_date,
             "allowed_data_versions": tuple(row["data_version"] for row in allowed_versions),
@@ -386,14 +394,13 @@ class SqlBackend:
                     )
                 knowledge_cutoff = self._parse_aware_datetime(publication_time)
             factors = self._get_adjustment_factor_map(
-                list(security_map),
+                resolved_security_ids,
                 start_date,
                 end_date,
                 knowledge_cutoff=knowledge_cutoff,
             )
             normalized = [self._apply_adjustment(row, adjust, factors) for row in normalized]
-        for row in normalized:
-            row["symbol"] = security_map.get(row["security_id"])
+        self._label_rows_with_historical_symbols(normalized, identity_by_day)
         projected = project(normalized, ["symbol"] + select_fields)
         resolved_version_code = allowed_versions[0]["version_code"] if query_mode == "vintage" else None
         return response(
@@ -421,7 +428,15 @@ class SqlBackend:
         start_date, end_date = ensure_required_dates(start_date, end_date)
         validate_enum(factor_type, {"forward", "backward", "both"}, "factor_type")
         validate_enum(query_mode, {"latest", "asof", "vintage"}, "query_mode")
-        security_map = self._resolve_security_map(symbols, security_ids, None, asof_date=end_date)
+        resolved_security_ids, identity_by_day = (
+            self._resolve_security_identities_over_range(
+                symbols,
+                security_ids,
+                None,
+                start_date,
+                end_date,
+            )
+        )
 
         fields = ["security_id", "trade_date", "ex_right_type"]
         if factor_type in {"forward", "both"}:
@@ -441,14 +456,24 @@ class SqlBackend:
               AND dc.dataset_code IN ('daily_bar', 'adjustment_factor')
               AND db.status = 'success'
               AND db.finished_at IS NOT NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM qmeta.dataset_version dv
+                  WHERE dv.dataset_id = db.dataset_id
+                    AND dv.batch_id = db.batch_id
+                    AND dv.status IN ('active', 'superseded')
+              )
             ORDER BY af.security_id, af.trade_date, af.revision_id DESC, af.ingest_time DESC,
                      af.batch_id DESC
             """,
-            {"security_ids": list(security_map), "start_date": start_date, "end_date": end_date},
+            {
+                "security_ids": resolved_security_ids,
+                "start_date": start_date,
+                "end_date": end_date,
+            },
         )
         normalized = normalize_rows(rows)
-        for row in normalized:
-            row["symbol"] = security_map.get(row["security_id"])
+        self._label_rows_with_historical_symbols(normalized, identity_by_day)
         return response(project(normalized, ["symbol"] + fields), ["adjustment_factor:sql"], query_mode)
 
     def get_trading_constraints(
@@ -506,8 +531,8 @@ class SqlBackend:
                   AND dc_limit.dataset_code IN ('limit_price_daily', 'daily_bar')
                   AND db_limit.status = 'success'
                   AND db_limit.finished_at IS NOT NULL
-                  AND db_limit.finished_at < (lp.trade_date + INTERVAL '1 day')
-                  AND lp.ingest_time < (lp.trade_date + INTERVAL '1 day')
+                  AND db_limit.finished_at < ((lp.trade_date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
+                  AND lp.ingest_time < ((lp.trade_date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
             ),
             selected_limits AS (
                 SELECT * FROM visible_limits WHERE revision_rank = 1
@@ -540,12 +565,12 @@ class SqlBackend:
                   AND db_suspension.status = 'success'
                   AND db_suspension.finished_at IS NOT NULL
                   AND db_suspension.finished_at <
-                      (generated.trade_date::date + INTERVAL '1 day')
+                      ((generated.trade_date::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                   AND sh.announce_time IS NOT NULL
                   AND sh.announce_time <
-                      (generated.trade_date::date + INTERVAL '1 day')
+                      ((generated.trade_date::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                   AND sh.ingest_time <
-                      (generated.trade_date::date + INTERVAL '1 day')
+                      ((generated.trade_date::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
             ),
             selected_suspension_days AS (
                 SELECT * FROM visible_suspension_day_revisions
@@ -564,25 +589,31 @@ class SqlBackend:
                 spine.trade_date,
                 COALESCE(lp.limit_up, NULL) AS limit_up,
                 COALESCE(lp.limit_down, NULL) AS limit_down,
-                COALESCE(lp.is_st, FALSE) AS is_st,
-                COALESCE(lp.is_new_listing, FALSE) AS is_new_listing,
+                CASE
+                    WHEN st.status IS NULL THEN NULL
+                    ELSE st.status IN ('st', 'star_st')
+                END AS is_st,
+                CASE WHEN lp.security_id IS NULL THEN NULL
+                    ELSE lp.is_new_listing
+                END AS is_new_listing,
                 EXISTS (
                     SELECT 1
                     FROM selected_suspension_days suspension_day
                     WHERE suspension_day.security_id = spine.security_id
                       AND suspension_day.trade_date = spine.trade_date
                 ) AS is_suspended,
-                COALESCE(st.status = 'delisting_period', FALSE) AS is_delisting_period,
-                GREATEST(
-                    (
+                CASE
+                    WHEN st.status IS NULL THEN NULL
+                    ELSE st.status = 'delisting_period'
+                END AS is_delisting_period,
+                CASE
+                    WHEN historical_identity.historical_list_date IS NULL THEN NULL
+                    ELSE GREATEST(
                         spine.trade_date
-                        - COALESCE(
-                            historical_identity.historical_list_date,
-                            spine.trade_date
-                        )
-                    ),
-                    0
-                ) AS list_days
+                            - historical_identity.historical_list_date,
+                        0
+                    )
+                END AS list_days
             FROM constraint_spine spine
             LEFT JOIN selected_limits lp
               ON lp.security_id = spine.security_id
@@ -610,11 +641,11 @@ class SqlBackend:
                       AND db_identifier_symbol.status = 'success'
                       AND db_identifier_symbol.finished_at IS NOT NULL
                       AND db_identifier_symbol.finished_at <
-                          (spine.trade_date + INTERVAL '1 day')
+                          ((spine.trade_date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                       AND sih.announce_time <
-                          (spine.trade_date + INTERVAL '1 day')
+                          ((spine.trade_date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                       AND sih.ingest_time <
-                          (spine.trade_date + INTERVAL '1 day')
+                          ((spine.trade_date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                 ) identifier_revision
                 WHERE identifier_revision.revision_rank = 1
                   AND (identifier_revision.end_date IS NULL
@@ -648,11 +679,11 @@ class SqlBackend:
                       AND db_identifier.status = 'success'
                       AND db_identifier.finished_at IS NOT NULL
                       AND db_identifier.finished_at <
-                          (spine.trade_date + INTERVAL '1 day')
+                          ((spine.trade_date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                       AND sih.announce_time <
-                          (spine.trade_date + INTERVAL '1 day')
+                          ((spine.trade_date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                       AND sih.ingest_time <
-                          (spine.trade_date + INTERVAL '1 day')
+                          ((spine.trade_date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                 ) identifier_revision
                 WHERE identifier_revision.revision_rank = 1
             ) historical_identity ON TRUE
@@ -676,11 +707,11 @@ class SqlBackend:
                       AND db_status.status = 'success'
                       AND db_status.finished_at IS NOT NULL
                       AND db_status.finished_at <
-                          (spine.trade_date + INTERVAL '1 day')
+                          ((spine.trade_date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                       AND st.announce_time <
-                          (spine.trade_date + INTERVAL '1 day')
+                          ((spine.trade_date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                       AND st.ingest_time <
-                          (spine.trade_date + INTERVAL '1 day')
+                          ((spine.trade_date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                 ) status_revision
                 WHERE status_revision.revision_rank = 1
                   AND (status_revision.end_date IS NULL
@@ -704,7 +735,10 @@ class SqlBackend:
         for row in normalized:
             if not row.get("symbol"):
                 row["symbol"] = security_map.get(row["security_id"])
-            blocked = row.get("is_suspended", False) or row.get("is_delisting_period", False)
+            blocked = (
+                row.get("is_suspended") is not False
+                or row.get("is_delisting_period") is not False
+            )
             row["can_buy"] = not blocked
             row["can_sell"] = not blocked
         return response(project(normalized, ["symbol", "security_id", "trade_date"] + requested_fields), ["trading_constraints:sql"], "latest")
@@ -837,10 +871,10 @@ class SqlBackend:
                   AND dc_metric.dataset_code = 'financial_metric_pit'
                   AND db_metric.status = 'success'
                   AND db_metric.finished_at IS NOT NULL
-                  AND db_metric.finished_at < (%(asof_date)s::date + INTERVAL '1 day')
-                  AND fm.announce_time < (%(asof_date)s::date + INTERVAL '1 day')
-                  AND fm.effective_time < (%(asof_date)s::date + INTERVAL '1 day')
-                  AND fm.ingest_time < (%(asof_date)s::date + INTERVAL '1 day')
+                  AND db_metric.finished_at < ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
+                  AND fm.announce_time < ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
+                  AND fm.effective_time < ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
+                  AND fm.ingest_time < ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                   {report_filter}
 
                 UNION ALL
@@ -869,10 +903,10 @@ class SqlBackend:
                   AND dc_statement.dataset_code = 'financial_statement_pit'
                   AND db_statement.status = 'success'
                   AND db_statement.finished_at IS NOT NULL
-                  AND db_statement.finished_at < (%(asof_date)s::date + INTERVAL '1 day')
-                  AND fs.announce_time < (%(asof_date)s::date + INTERVAL '1 day')
-                  AND fs.effective_time < (%(asof_date)s::date + INTERVAL '1 day')
-                  AND fs.ingest_time < (%(asof_date)s::date + INTERVAL '1 day')
+                  AND db_statement.finished_at < ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
+                  AND fs.announce_time < ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
+                  AND fs.effective_time < ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
+                  AND fs.ingest_time < ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                   {report_filter}
             ),
             revision_ranked AS (
@@ -955,17 +989,31 @@ class SqlBackend:
                   AND dc.dataset_code = 'index_member_pit'
                   AND db.status = 'success'
                   AND db.finished_at IS NOT NULL
-                  AND db.finished_at < (%(asof_date)s::date + INTERVAL '1 day')
+                  AND db.finished_at < ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                   AND mp.announce_time IS NOT NULL
-                  AND mp.announce_time < (%(asof_date)s::date + INTERVAL '1 day')
-                  AND mp.ingest_time < (%(asof_date)s::date + INTERVAL '1 day')
+                  AND mp.announce_time < ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
+                  AND mp.ingest_time < ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                   AND mp.effective_date <= %(asof_date)s
             ),
-            selected_members AS (
+            active_member_episodes AS (
                 SELECT *
                 FROM known_revisions
                 WHERE revision_rank = 1
                   AND (end_date IS NULL OR end_date >= %(asof_date)s)
+            ),
+            selected_members AS (
+                SELECT *
+                FROM (
+                    SELECT
+                        active_member_episodes.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY index_id, security_id
+                            ORDER BY effective_date DESC, revision_id DESC,
+                                     ingest_time DESC, batch_id DESC
+                        ) AS _qdata_episode_rank
+                    FROM active_member_episodes
+                ) ranked_episodes
+                WHERE _qdata_episode_rank = 1
             )
             SELECT
                 im.index_code,
@@ -999,11 +1047,11 @@ class SqlBackend:
                       AND db_identifier.status = 'success'
                       AND db_identifier.finished_at IS NOT NULL
                       AND db_identifier.finished_at <
-                          (%(asof_date)s::date + INTERVAL '1 day')
+                          ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                       AND sih.announce_time <
-                          (%(asof_date)s::date + INTERVAL '1 day')
+                          ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                       AND sih.ingest_time <
-                          (%(asof_date)s::date + INTERVAL '1 day')
+                          ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                 ) identifier_revision
                 WHERE identifier_revision.revision_rank = 1
                   AND (identifier_revision.end_date IS NULL
@@ -1058,11 +1106,11 @@ class SqlBackend:
                   AND db_category.status = 'success'
                   AND db_category.finished_at IS NOT NULL
                   AND db_category.finished_at <
-                      (%(asof_date)s::date + INTERVAL '1 day')
+                      ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                   AND ich.announce_time <
-                      (%(asof_date)s::date + INTERVAL '1 day')
+                      ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                   AND ich.ingest_time <
-                      (%(asof_date)s::date + INTERVAL '1 day')
+                      ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
             ),
             visible_category_episodes AS (
                 SELECT * FROM category_revisions
@@ -1104,16 +1152,31 @@ class SqlBackend:
                   AND dc.dataset_code = 'industry_membership_pit'
                   AND db.status = 'success'
                   AND db.finished_at IS NOT NULL
-                  AND db.finished_at < (%(asof_date)s::date + INTERVAL '1 day')
+                  AND db.finished_at < ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                   AND mem.announce_time IS NOT NULL
-                  AND mem.announce_time < (%(asof_date)s::date + INTERVAL '1 day')
-                  AND mem.ingest_time < (%(asof_date)s::date + INTERVAL '1 day')
+                  AND mem.announce_time < ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
+                  AND mem.ingest_time < ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                   AND mem.effective_date <= %(asof_date)s
             ),
-            selected_members AS (
+            active_member_episodes AS (
                 SELECT * FROM known_revisions
                 WHERE revision_rank = 1
                   AND (end_date IS NULL OR end_date >= %(asof_date)s)
+            ),
+            selected_members AS (
+                SELECT *
+                FROM (
+                    SELECT
+                        active_member_episodes.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY security_id, industry_system_id
+                            ORDER BY effective_date DESC, revision_id DESC,
+                                     ingest_time DESC, batch_id DESC,
+                                     industry_id DESC
+                        ) AS _qdata_episode_rank
+                    FROM active_member_episodes
+                ) ranked_episodes
+                WHERE _qdata_episode_rank = 1
             )
             SELECT
                 identifier.symbol || '.' || identifier.exchange AS symbol,
@@ -1152,11 +1215,11 @@ class SqlBackend:
                       AND db_identifier.status = 'success'
                       AND db_identifier.finished_at IS NOT NULL
                       AND db_identifier.finished_at <
-                          (%(asof_date)s::date + INTERVAL '1 day')
+                          ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                       AND sih.announce_time <
-                          (%(asof_date)s::date + INTERVAL '1 day')
+                          ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                       AND sih.ingest_time <
-                          (%(asof_date)s::date + INTERVAL '1 day')
+                          ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                 ) identifier_revision
                 WHERE identifier_revision.revision_rank = 1
                   AND (identifier_revision.end_date IS NULL
@@ -1218,7 +1281,7 @@ class SqlBackend:
                       AND us.trade_date = %(asof_date)s
                       AND db.status = 'success'
                       AND db.finished_at IS NOT NULL
-                      AND db.finished_at < (%(asof_date)s::date + INTERVAL '1 day')
+                      AND db.finished_at < ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                     ORDER BY db.finished_at DESC, db.batch_id DESC
                     LIMIT 1
                 ),
@@ -1239,10 +1302,10 @@ class SqlBackend:
                     JOIN qmeta.dataset_catalog dc ON dc.dataset_id = db.dataset_id
                     WHERE db.status = 'success'
                       AND db.finished_at IS NOT NULL
-                      AND db.finished_at < (%(asof_date)s::date + INTERVAL '1 day')
+                      AND db.finished_at < ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                       AND um.announce_time IS NOT NULL
-                      AND um.announce_time < (%(asof_date)s::date + INTERVAL '1 day')
-                      AND um.ingest_time < (%(asof_date)s::date + INTERVAL '1 day')
+                      AND um.announce_time < ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
+                      AND um.ingest_time < ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                       AND (
                           (
                               ud.universe_type = 'rule_based'
@@ -1257,10 +1320,24 @@ class SqlBackend:
                           )
                       )
                 ),
-                selected_members AS (
+                active_member_episodes AS (
                     SELECT * FROM known_revisions
                     WHERE revision_rank = 1
                       AND (end_date IS NULL OR end_date >= %(asof_date)s)
+                ),
+                selected_members AS (
+                    SELECT *
+                    FROM (
+                        SELECT
+                            active_member_episodes.*,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY universe_id, security_id
+                                ORDER BY effective_date DESC, revision_id DESC,
+                                         ingest_time DESC, batch_id DESC
+                            ) AS _qdata_episode_rank
+                        FROM active_member_episodes
+                    ) ranked_episodes
+                    WHERE _qdata_episode_rank = 1
                 )
                 SELECT
                     um.universe_code AS universe,
@@ -1292,11 +1369,11 @@ class SqlBackend:
                           AND db_identifier.status = 'success'
                           AND db_identifier.finished_at IS NOT NULL
                           AND db_identifier.finished_at <
-                              (%(asof_date)s::date + INTERVAL '1 day')
+                              ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                           AND sih.announce_time <
-                              (%(asof_date)s::date + INTERVAL '1 day')
+                              ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                           AND sih.ingest_time <
-                              (%(asof_date)s::date + INTERVAL '1 day')
+                              ((%(asof_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                     ) identifier_revision
                     WHERE identifier_revision.revision_rank = 1
                       AND (identifier_revision.end_date IS NULL
@@ -1327,15 +1404,28 @@ class SqlBackend:
                     # constraint evidence must exclude the member, not silently
                     # treat every risk flag as false.
                     continue
-                if filters.get("exclude_st") and constraint.get("is_st"):
+                if filters.get("exclude_st") and constraint.get("is_st") is not False:
                     continue
-                if filters.get("exclude_suspended") and constraint.get("is_suspended"):
+                if (
+                    filters.get("exclude_suspended")
+                    and constraint.get("is_suspended") is not False
+                ):
                     continue
-                if filters.get("exclude_delisting_period") and constraint.get("is_delisting_period"):
+                if (
+                    filters.get("exclude_delisting_period")
+                    and constraint.get("is_delisting_period") is not False
+                ):
                     continue
-                if filters.get("exclude_new_listing") and constraint.get("is_new_listing"):
+                if (
+                    filters.get("exclude_new_listing")
+                    and constraint.get("is_new_listing") is not False
+                ):
                     continue
-                if constraint.get("list_days", 10_000) < filters.get("min_list_days", 0):
+                minimum_list_days = filters.get("min_list_days", 0)
+                if minimum_list_days and (
+                    constraint.get("list_days") is None
+                    or constraint["list_days"] < minimum_list_days
+                ):
                     continue
                 filtered.append(row)
             rows = filtered
@@ -1364,13 +1454,30 @@ class SqlBackend:
         start_date, end_date = ensure_required_dates(start_date, end_date)
         validate_enum(format, {"long", "wide"}, "format")
         validate_enum(query_mode, {"latest", "asof", "vintage"}, "query_mode")
-        security_map = self._resolve_security_map(symbols, None, universe, asof_date=end_date)
+        resolved_security_ids, identity_by_day = (
+            self._resolve_security_identities_over_range(
+                symbols,
+                None,
+                universe,
+                start_date,
+                end_date,
+            )
+        )
         factor_map = self._resolve_factor_map(factors, factor_version)
+        allowed_versions = self._resolve_allowed_dataset_versions(
+            "factor_value_daily",
+            query_mode="latest",
+            asof_time=None,
+            requested_version=None,
+        )
         factor_pair_clauses = []
         params: dict[str, Any] = {
-            "security_ids": tuple(security_map),
+            "security_ids": tuple(resolved_security_ids),
             "start_date": start_date,
             "end_date": end_date,
+            "allowed_data_versions": tuple(
+                row["data_version"] for row in allowed_versions
+            ),
         }
         for index, (factor_id, factor) in enumerate(sorted(factor_map.items())):
             factor_id_param = f"factor_pair_{index}_factor_id"
@@ -1384,7 +1491,8 @@ class SqlBackend:
         rows = self.clickhouse.fetch_all(
             f"""
             SELECT factor_id, factor_version_id, security_id, trade_date,
-                   factor_value, quality_flag, data_version, calc_time
+                   factor_value, quality_flag, data_version, calc_time,
+                   _qdata_conflict_count
             FROM (
                 SELECT
                     factor_id,
@@ -1395,14 +1503,25 @@ class SqlBackend:
                     quality_flag,
                     data_version,
                     calc_time,
+                    uniqExact(tuple(
+                        factor_value,
+                        quality_flag,
+                        universe_id
+                    )) OVER (
+                        PARTITION BY factor_id, factor_version_id, security_id,
+                                     trade_date, data_version, calc_time
+                    ) AS _qdata_conflict_count,
                     ROW_NUMBER() OVER (
                         PARTITION BY factor_id, factor_version_id, security_id, trade_date
-                        ORDER BY data_version DESC, calc_time DESC
+                        ORDER BY data_version DESC, calc_time DESC,
+                                 factor_value DESC, quality_flag DESC,
+                                 universe_id DESC
                     ) AS _qdata_revision_rank
-                FROM qts.factor_value_daily FINAL
+                FROM qts.factor_value_daily
                 WHERE ({" OR ".join(factor_pair_clauses)})
                   AND security_id IN %(security_ids)s
                   AND trade_date BETWEEN %(start_date)s AND %(end_date)s
+                  AND data_version IN %(allowed_data_versions)s
             )
             WHERE _qdata_revision_rank = 1
             ORDER BY trade_date, security_id, factor_id
@@ -1410,13 +1529,33 @@ class SqlBackend:
             params,
         )
         normalized = normalize_rows(rows)
+        conflicts = [
+            row
+            for row in normalized
+            if int(row.get("_qdata_conflict_count", 1)) != 1
+        ]
+        if conflicts:
+            conflict = conflicts[0]
+            raise QDataValidationError(
+                "conflicting factor rows share the same identity, data_version, "
+                "and calc_time: "
+                f"factor_id={conflict.get('factor_id')}, "
+                f"factor_version_id={conflict.get('factor_version_id')}, "
+                f"security_id={conflict.get('security_id')}, "
+                f"trade_date={conflict.get('trade_date')}"
+            )
+        for row in normalized:
+            row.pop("_qdata_conflict_count", None)
         factor_code_by_id = {factor_id: factor["factor_code"] for factor_id, factor in factor_map.items()}
         version_code_by_id = {
             factor["factor_version_id"]: factor["version_code"]
             for factor in factor_map.values()
         }
         for row in normalized:
-            row["symbol"] = security_map.get(row["security_id"])
+            row["symbol"] = self._historical_symbol_for_row(
+                row,
+                identity_by_day,
+            )
             row["factor_code"] = factor_code_by_id.get(row["factor_id"])
             row["factor_version"] = version_code_by_id.get(row["factor_version_id"])
         if format == "wide":
@@ -1426,7 +1565,11 @@ class SqlBackend:
                 normalized,
                 ["symbol", "security_id", "trade_date", "factor_code", "factor_value", "factor_version", "quality_flag"],
             )
-        return response(normalized, ["factor_value_daily:sql"], query_mode)
+        return response(
+            normalized,
+            [row["version_code"] for row in allowed_versions],
+            query_mode,
+        )
 
     def get_dataset_health(
         self,
@@ -1546,13 +1689,15 @@ class SqlBackend:
                   AND dc.dataset_code = 'security_master'
                   AND db.status = 'success'
                   AND db.finished_at IS NOT NULL
-                  AND db.finished_at < (%(end_date)s::date + INTERVAL '1 day')
+                  AND db.finished_at < ((%(end_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                   AND sih.announce_time <
-                      (%(end_date)s::date + INTERVAL '1 day')
+                      ((%(end_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                   AND sih.ingest_time <
-                      (%(end_date)s::date + INTERVAL '1 day')
+                      ((%(end_date)s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
             )
-            SELECT DISTINCT security_id
+            SELECT DISTINCT
+                symbol || '.' || exchange AS requested_symbol,
+                security_id
             FROM qdata_requested_identity_range
             WHERE revision_rank = 1
               AND (end_date IS NULL OR end_date >= %(start_date)s)
@@ -1565,10 +1710,186 @@ class SqlBackend:
                 "end_date": end_date,
             },
         )
-        security_ids = [int(row["security_id"]) for row in normalize_rows(rows)]
+        normalized = normalize_rows(rows)
+        ids_by_symbol: dict[str, set[int]] = {
+            symbol: set() for symbol in symbols
+        }
+        for row in normalized:
+            requested_symbol = row.get("requested_symbol")
+            if requested_symbol is None and len(symbols) == 1:
+                requested_symbol = symbols[0]
+            if requested_symbol in ids_by_symbol:
+                ids_by_symbol[requested_symbol].add(int(row["security_id"]))
+        ambiguous = sorted(
+            symbol for symbol, matches in ids_by_symbol.items() if len(matches) > 1
+        )
+        if ambiguous:
+            raise QDataValidationError(
+                "ticker identity is ambiguous over the requested date range; "
+                f"use stable security_ids instead: {ambiguous}"
+            )
+        security_ids = sorted(
+            {
+                int(row["security_id"])
+                for row in normalized
+            }
+        )
         if not security_ids:
             raise QDataNotFoundError("No securities matched the requested date range")
         return security_ids
+
+    def _resolve_security_identities_over_range(
+        self,
+        symbols: list[str] | None,
+        security_ids: list[int] | None,
+        universe: str | None,
+        start_date: str,
+        end_date: str,
+    ) -> tuple[list[int], dict[tuple[int, str], str]]:
+        if universe and not symbols and not security_ids:
+            universe_rows = self.get_universe(universe, end_date, {}, False)["data"]
+            resolved_ids = sorted(
+                {int(row["security_id"]) for row in universe_rows}
+            )
+        elif symbols:
+            normalized_symbols = [
+                f"{code}.{exchange}"
+                for code, exchange in (
+                    self._split_symbol(symbol) for symbol in symbols
+                )
+            ]
+            resolved_ids = self._resolve_security_ids_over_range(
+                normalized_symbols,
+                start_date,
+                end_date,
+            )
+        elif security_ids:
+            resolved_ids = sorted({int(security_id) for security_id in security_ids})
+        else:
+            raise QDataValidationError(
+                "symbols, security_ids, or universe is required"
+            )
+        if not resolved_ids:
+            raise QDataNotFoundError("No securities matched the requested date range")
+
+        rows = normalize_rows(
+            self.postgres.fetch_all(
+                """
+                WITH qdata_security_identity_days AS (
+                    SELECT
+                        requested.security_id,
+                        generated.trade_date::date AS trade_date
+                    FROM unnest(%(security_ids)s::bigint[]) AS requested(security_id)
+                    CROSS JOIN LATERAL generate_series(
+                        %(start_date)s::date,
+                        %(end_date)s::date,
+                        INTERVAL '1 day'
+                    ) AS generated(trade_date)
+                )
+                SELECT
+                    identity_days.security_id,
+                    identity_days.trade_date,
+                    identifier.symbol || '.' || identifier.exchange AS symbol
+                FROM qdata_security_identity_days identity_days
+                JOIN LATERAL (
+                    SELECT
+                        identifier_revision.symbol,
+                        identifier_revision.exchange
+                    FROM (
+                        SELECT
+                            sih.*,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY sih.security_id,
+                                             sih.identifier_type,
+                                             sih.start_date
+                                ORDER BY sih.revision_id DESC,
+                                         sih.ingest_time DESC,
+                                         sih.batch_id DESC,
+                                         sih.symbol DESC
+                            ) AS revision_rank
+                        FROM qmeta.security_identifier_history sih
+                        JOIN qmeta.data_batch db
+                          ON db.batch_id = sih.batch_id
+                        JOIN qmeta.dataset_catalog dc
+                          ON dc.dataset_id = db.dataset_id
+                        WHERE sih.security_id = identity_days.security_id
+                          AND sih.identifier_type = 'trade_symbol'
+                          AND sih.start_date <= identity_days.trade_date
+                          AND dc.dataset_code = 'security_master'
+                          AND db.status = 'success'
+                          AND db.finished_at IS NOT NULL
+                          AND db.finished_at < (
+                              (identity_days.trade_date + 1)::timestamp
+                              AT TIME ZONE 'Asia/Shanghai'
+                          )
+                          AND sih.announce_time < (
+                              (identity_days.trade_date + 1)::timestamp
+                              AT TIME ZONE 'Asia/Shanghai'
+                          )
+                          AND sih.ingest_time < (
+                              (identity_days.trade_date + 1)::timestamp
+                              AT TIME ZONE 'Asia/Shanghai'
+                          )
+                    ) identifier_revision
+                    WHERE identifier_revision.revision_rank = 1
+                      AND (
+                          identifier_revision.end_date IS NULL
+                          OR identifier_revision.end_date >= identity_days.trade_date
+                      )
+                    ORDER BY identifier_revision.start_date DESC,
+                             identifier_revision.revision_id DESC,
+                             identifier_revision.ingest_time DESC,
+                             identifier_revision.batch_id DESC,
+                             identifier_revision.symbol DESC
+                    LIMIT 1
+                ) identifier ON TRUE
+                ORDER BY identity_days.security_id, identity_days.trade_date
+                """,
+                {
+                    "security_ids": resolved_ids,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                },
+            )
+        )
+        identity_by_day: dict[tuple[int, str], str] = {}
+        for row in rows:
+            key = (int(row["security_id"]), str(row["trade_date"]))
+            symbol = row["symbol"]
+            previous = identity_by_day.get(key)
+            if previous is not None and previous != symbol:
+                raise QDataValidationError(
+                    "multiple historical tickers are visible for "
+                    f"security_id={key[0]}, trade_date={key[1]}"
+                )
+            identity_by_day[key] = symbol
+        return resolved_ids, identity_by_day
+
+    @staticmethod
+    def _historical_symbol_for_row(
+        row: dict[str, Any],
+        identity_by_day: dict[tuple[int, str], str],
+    ) -> str:
+        key = (int(row["security_id"]), str(row["trade_date"]))
+        symbol = identity_by_day.get(key)
+        if symbol is None:
+            raise QDataValidationError(
+                "no unique point-in-time ticker is available for "
+                f"security_id={key[0]}, trade_date={key[1]}"
+            )
+        return symbol
+
+    @classmethod
+    def _label_rows_with_historical_symbols(
+        cls,
+        rows: list[dict[str, Any]],
+        identity_by_day: dict[tuple[int, str], str],
+    ) -> None:
+        for row in rows:
+            row["symbol"] = cls._historical_symbol_for_row(
+                row,
+                identity_by_day,
+            )
 
     def _resolve_factor_map(self, factors: list[str], factor_version: str) -> dict[int, dict[str, Any]]:
         rows = self.postgres.fetch_all(
@@ -1608,6 +1929,7 @@ class SqlBackend:
         where = [
             "dc.dataset_code = %(dataset_code)s",
             "db.status = 'success'",
+            "db.finished_at IS NOT NULL",
             "dv.status IN ('active', 'superseded')",
         ]
         params: dict[str, Any] = {"dataset_code": dataset_code}
@@ -1615,7 +1937,6 @@ class SqlBackend:
             where.extend(
                 [
                     "dv.valid_from <= %(asof_time)s",
-                    "db.finished_at IS NOT NULL",
                     "db.finished_at <= %(asof_time)s",
                 ]
             )
@@ -1623,7 +1944,6 @@ class SqlBackend:
         elif query_mode == "vintage":
             where.extend(
                 [
-                    "db.finished_at IS NOT NULL",
                     "(dv.version_code = %(requested_data_version)s "
                     "OR CAST(dv.data_version AS TEXT) = %(requested_data_version)s)",
                 ]
@@ -1676,6 +1996,10 @@ class SqlBackend:
             "dc.dataset_code = ANY(%(knowledge_dataset_codes)s)",
             "db.status = 'success'",
             "db.finished_at IS NOT NULL",
+            "EXISTS (SELECT 1 FROM qmeta.dataset_version dv "
+            "WHERE dv.dataset_id = db.dataset_id "
+            "AND dv.batch_id = db.batch_id "
+            "AND dv.status IN ('active', 'superseded'))",
         ]
         params: dict[str, Any] = {
             "security_ids": security_ids,

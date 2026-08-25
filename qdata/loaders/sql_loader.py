@@ -94,6 +94,13 @@ class SqlDailyBundleLoader:
         self.open()
         if not records:
             return
+        # An explicit security_id is a stable identity assertion.  Validate the
+        # complete input and any current target-symbol owner before creating an
+        # audit batch or mutating master/history state.  In particular, a
+        # symbol-only placeholder may already own the target ticker; silently
+        # re-keying that row would orphan PostgreSQL/ClickHouse facts because
+        # there is no cross-store transaction that can prove such a merge safe.
+        self._preflight_security_master_records(records)
         source_id = self._source_id()
         batch_id = self._create_batch("security_master", source_id, None, len(records))
         try:
@@ -450,18 +457,19 @@ class SqlDailyBundleLoader:
         source_id = self._source_id()
         security_map = self._security_id_map(symbols)
         factor_batch_id = None
+        factor_versioned_batch: VersionedBatch | None = None
         limit_batch_id = None
         suspension_batch_id = None
         batch_ids: list[int] = []
         try:
             if adjustment_factors:
-                factor_batch_id = self._create_batch(
+                factor_versioned_batch = self._create_versioned_batch(
                     "adjustment_factor",
                     source_id,
                     _first_trade_date(adjustment_factors),
                     len(adjustment_factors),
                 )
-                batch_ids.append(factor_batch_id)
+                factor_batch_id = factor_versioned_batch.batch_id
             if limit_prices:
                 limit_batch_id = self._create_batch(
                     "limit_price_daily",
@@ -515,9 +523,17 @@ class SqlDailyBundleLoader:
                         source_id=source_id,
                         batch_id=suspension_batch_id,
                     )
-            self._finish_batches(batch_ids, "success")
+            self._finish_market_constraint_batches(
+                factor_versioned_batch,
+                batch_ids,
+                "success",
+            )
         except Exception as exc:
-            self._record_lifecycle_failure(exc, batch_ids=batch_ids)
+            self._record_market_constraint_failure(
+                exc,
+                factor_versioned_batch,
+                batch_ids,
+            )
             raise
 
     def load_minute_bars(self, records: list[MinuteBarRecord]) -> None:
@@ -769,6 +785,59 @@ class SqlDailyBundleLoader:
         if not row:
             raise QDataValidationError(f"dataset not found: {dataset_code}")
         return row["dataset_id"]
+
+    def _preflight_security_master_records(
+        self,
+        records: list[SecurityRecord],
+    ) -> None:
+        target_owner: dict[tuple[str, str, str], int] = {}
+        id_target: dict[int, tuple[str, str, str]] = {}
+        for record in records:
+            if record.security_id is None:
+                continue
+            target = (record.asset_type, record.exchange, record.code)
+            previous_id = target_owner.get(target)
+            if previous_id is not None and previous_id != record.security_id:
+                raise QDataValidationError(
+                    "security-master batch maps one target symbol to multiple "
+                    f"security_ids: {record.symbol}"
+                )
+            previous_target = id_target.get(record.security_id)
+            if previous_target is not None and previous_target != target:
+                raise QDataValidationError(
+                    "security-master batch maps one security_id to multiple "
+                    f"target symbols: {record.security_id}"
+                )
+            target_owner[target] = record.security_id
+            id_target[record.security_id] = target
+
+        if not target_owner:
+            return
+        with self._postgres.cursor() as cursor:
+            for (asset_type, exchange, symbol), security_id in sorted(
+                target_owner.items()
+            ):
+                cursor.execute(
+                    """
+                    SELECT security_id AS target_security_id
+                    FROM qmeta.security_master
+                    WHERE asset_type = %s
+                      AND exchange = %s
+                      AND current_symbol = %s
+                    FOR KEY SHARE
+                    """,
+                    (asset_type, exchange, symbol),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    continue
+                owner_id = int(row["target_security_id"])
+                if owner_id != int(security_id):
+                    raise QDataValidationError(
+                        f"target symbol {symbol}.{exchange} is already owned by "
+                        f"security_id {owner_id}; refusing unsafe cross-identity "
+                        "merge/re-key"
+                    )
 
     @staticmethod
     def _upsert_security_master(
@@ -1678,6 +1747,35 @@ class SqlDailyBundleLoader:
             )
         self._postgres.commit()
 
+    def _finish_market_constraint_batches(
+        self,
+        factor_versioned_batch: VersionedBatch | None,
+        batch_ids: list[int],
+        status: str,
+        error_message: str | None = None,
+    ) -> None:
+        if status not in {"success", "failed"}:
+            raise QDataValidationError("batch terminal status must be success or failed")
+        if factor_versioned_batch is None and not batch_ids:
+            return
+        version_status = "active" if status == "success" else "recalled"
+        with self._postgres.cursor() as cursor:
+            if factor_versioned_batch is not None:
+                self._transition_batch(
+                    cursor,
+                    factor_versioned_batch.batch_id,
+                    status,
+                    error_message,
+                )
+                self._transition_dataset_version(
+                    cursor,
+                    factor_versioned_batch.data_version,
+                    version_status,
+                )
+            for batch_id in batch_ids:
+                self._transition_batch(cursor, batch_id, status, error_message)
+        self._postgres.commit()
+
     @staticmethod
     def _transition_batch(
         cursor: Any,
@@ -1772,6 +1870,29 @@ class SqlDailyBundleLoader:
                 )
             elif batch_ids:
                 self._finish_batches(batch_ids, "failed", str(primary_error))
+        except Exception as exc:
+            secondary_errors.append(exc)
+        if secondary_errors:
+            self._attach_lifecycle_errors(primary_error, secondary_errors)
+
+    def _record_market_constraint_failure(
+        self,
+        primary_error: Exception,
+        factor_versioned_batch: VersionedBatch | None,
+        batch_ids: list[int],
+    ) -> None:
+        secondary_errors: list[Exception] = []
+        try:
+            self._postgres.rollback()
+        except Exception as exc:
+            secondary_errors.append(exc)
+        try:
+            self._finish_market_constraint_batches(
+                factor_versioned_batch,
+                batch_ids,
+                "failed",
+                str(primary_error),
+            )
         except Exception as exc:
             secondary_errors.append(exc)
         if secondary_errors:

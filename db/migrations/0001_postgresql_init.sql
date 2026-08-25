@@ -446,6 +446,32 @@ CREATE TABLE IF NOT EXISTS qmeta.universe_definition (
     CHECK (universe_type IN ('index', 'rule_based', 'manual', 'strategy'))
 );
 
+-- A universe's type determines which PIT selection contract applies.  Changing
+-- it in place would reinterpret existing membership history, so type changes
+-- must be represented by a new universe_definition row instead.
+CREATE OR REPLACE FUNCTION qmeta.reject_universe_type_change()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NEW.universe_type IS DISTINCT FROM OLD.universe_type THEN
+        RAISE EXCEPTION
+            'universe_type is immutable for universe_id %; create a new universe instead',
+            OLD.universe_id
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_universe_type_immutable
+    ON qmeta.universe_definition;
+
+CREATE TRIGGER trg_universe_type_immutable
+    BEFORE UPDATE OF universe_type ON qmeta.universe_definition
+    FOR EACH ROW
+    EXECUTE FUNCTION qmeta.reject_universe_type_change();
+
 CREATE TABLE IF NOT EXISTS qmeta.universe_snapshot (
     snapshot_id         BIGSERIAL PRIMARY KEY,
     universe_id         BIGINT NOT NULL REFERENCES qmeta.universe_definition(universe_id),
