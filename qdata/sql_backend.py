@@ -419,15 +419,16 @@ class SqlBackend:
         end_date: str | None,
         factor_type: str,
         query_mode: str,
+        asof_time: str | None,
+        data_version: str | None,
     ) -> dict[str, Any]:
-        if query_mode != "latest":
-            raise QDataValidationError(
-                "get_adjustment_factor only supports query_mode='latest'; its public "
-                "signature does not expose a knowledge cutoff or immutable data version"
-            )
         start_date, end_date = ensure_required_dates(start_date, end_date)
         validate_enum(factor_type, {"forward", "backward", "both"}, "factor_type")
         validate_enum(query_mode, {"latest", "asof", "vintage"}, "query_mode")
+        cutoff = self._validate_price_mode(query_mode, asof_time, data_version)
+        selected_version = None
+        if query_mode == "vintage":
+            selected_version = self._resolve_adjustment_vintage(str(data_version))
         resolved_security_ids, identity_by_day = (
             self._resolve_security_identities_over_range(
                 symbols,
@@ -445,36 +446,62 @@ class SqlBackend:
             fields.append("factor_backward")
         selected_fields = ", ".join(f"af.{field} AS {field}" for field in fields)
 
+        where = [
+            "af.security_id = ANY(%(security_ids)s)",
+            "af.trade_date BETWEEN %(start_date)s AND %(end_date)s",
+            "dc.dataset_code IN ('daily_bar', 'adjustment_factor')",
+            "db.status = 'success'",
+            "db.finished_at IS NOT NULL",
+            "dv.status IN ('active', 'superseded')",
+        ]
+        params: dict[str, Any] = {
+            "security_ids": resolved_security_ids,
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+        if cutoff is not None:
+            where.extend([
+                "dv.valid_from <= %(asof_time)s",
+                "db.finished_at <= %(asof_time)s",
+                "af.ingest_time <= %(asof_time)s",
+                "af.announce_time IS NOT NULL",
+                "af.announce_time <= %(asof_time)s",
+                "af.effective_time IS NOT NULL",
+                "af.effective_time <= %(asof_time)s",
+            ])
+            params["asof_time"] = cutoff
+        if selected_version is not None:
+            where.extend([
+                "dc.dataset_code = %(selected_dataset_code)s",
+                "af.batch_id = %(batch_id)s",
+            ])
+            params["selected_dataset_code"] = selected_version["dataset_code"]
+            params["batch_id"] = selected_version["batch_id"]
+
         rows = self.postgres.fetch_all(
             f"""
             SELECT DISTINCT ON (af.security_id, af.trade_date) {selected_fields}
             FROM qmeta.adjustment_factor af
             JOIN qmeta.data_batch db ON db.batch_id = af.batch_id
             JOIN qmeta.dataset_catalog dc ON dc.dataset_id = db.dataset_id
-            WHERE af.security_id = ANY(%(security_ids)s)
-              AND af.trade_date BETWEEN %(start_date)s AND %(end_date)s
-              AND dc.dataset_code IN ('daily_bar', 'adjustment_factor')
-              AND db.status = 'success'
-              AND db.finished_at IS NOT NULL
-              AND EXISTS (
-                  SELECT 1
-                  FROM qmeta.dataset_version dv
-                  WHERE dv.dataset_id = db.dataset_id
-                    AND dv.batch_id = db.batch_id
-                    AND dv.status IN ('active', 'superseded')
-              )
+            JOIN qmeta.dataset_version dv
+              ON dv.dataset_id = db.dataset_id AND dv.batch_id = db.batch_id
+            {self._where(where)}
             ORDER BY af.security_id, af.trade_date, af.revision_id DESC, af.ingest_time DESC,
                      af.batch_id DESC
             """,
-            {
-                "security_ids": resolved_security_ids,
-                "start_date": start_date,
-                "end_date": end_date,
-            },
+            params,
         )
         normalized = normalize_rows(rows)
         self._label_rows_with_historical_symbols(normalized, identity_by_day)
-        return response(project(normalized, ["symbol"] + fields), ["adjustment_factor:sql"], query_mode)
+        resolved_version = selected_version["version_code"] if selected_version else None
+        return response(
+            project(normalized, ["symbol"] + fields),
+            [resolved_version or "adjustment_factor:sql"],
+            query_mode,
+            cutoff.isoformat() if cutoff is not None else None,
+            resolved_version,
+        )
 
     def get_trading_constraints(
         self,
@@ -1442,18 +1469,16 @@ class SqlBackend:
         end_date: str | None,
         factor_version: str,
         query_mode: str,
+        asof_time: str | None,
+        data_version: str | None,
         format: str,
     ) -> dict[str, Any]:
-        if query_mode != "latest":
-            raise QDataValidationError(
-                "get_factor only supports query_mode='latest'; its public signature "
-                "does not expose a knowledge cutoff or immutable data version"
-            )
         if self.clickhouse is None:
             raise QDataValidationError("clickhouse_dsn or clickhouse client is required for factor queries")
         start_date, end_date = ensure_required_dates(start_date, end_date)
         validate_enum(format, {"long", "wide"}, "format")
         validate_enum(query_mode, {"latest", "asof", "vintage"}, "query_mode")
+        cutoff = self._validate_price_mode(query_mode, asof_time, data_version)
         resolved_security_ids, identity_by_day = (
             self._resolve_security_identities_over_range(
                 symbols,
@@ -1466,9 +1491,9 @@ class SqlBackend:
         factor_map = self._resolve_factor_map(factors, factor_version)
         allowed_versions = self._resolve_allowed_dataset_versions(
             "factor_value_daily",
-            query_mode="latest",
-            asof_time=None,
-            requested_version=None,
+            query_mode=query_mode,
+            asof_time=cutoff,
+            requested_version=data_version,
         )
         factor_pair_clauses = []
         params: dict[str, Any] = {
@@ -1488,6 +1513,10 @@ class SqlBackend:
             )
             params[factor_id_param] = factor_id
             params[version_id_param] = factor["factor_version_id"]
+        cutoff_clause = ""
+        if cutoff is not None:
+            cutoff_clause = "AND calc_time <= %(asof_time)s"
+            params["asof_time"] = cutoff
         rows = self.clickhouse.fetch_all(
             f"""
             SELECT factor_id, factor_version_id, security_id, trade_date,
@@ -1522,6 +1551,7 @@ class SqlBackend:
                   AND security_id IN %(security_ids)s
                   AND trade_date BETWEEN %(start_date)s AND %(end_date)s
                   AND data_version IN %(allowed_data_versions)s
+                  {cutoff_clause}
             )
             WHERE _qdata_revision_rank = 1
             ORDER BY trade_date, security_id, factor_id
@@ -1565,11 +1595,37 @@ class SqlBackend:
                 normalized,
                 ["symbol", "security_id", "trade_date", "factor_code", "factor_value", "factor_version", "quality_flag"],
             )
+        resolved_version = allowed_versions[0]["version_code"] if query_mode == "vintage" else None
         return response(
             normalized,
             [row["version_code"] for row in allowed_versions],
             query_mode,
+            cutoff.isoformat() if cutoff is not None else None,
+            resolved_version,
         )
+
+    def _resolve_adjustment_vintage(self, requested_version: str) -> dict[str, Any]:
+        matches: list[dict[str, Any]] = []
+        for dataset_code in ("daily_bar", "adjustment_factor"):
+            try:
+                rows = self._resolve_allowed_dataset_versions(
+                    dataset_code,
+                    query_mode="vintage",
+                    asof_time=None,
+                    requested_version=requested_version,
+                )
+            except QDataNotFoundError:
+                continue
+            matches.extend({**row, "dataset_code": dataset_code} for row in rows)
+        if not matches:
+            raise QDataNotFoundError(
+                f"Unknown or unavailable data_version for adjustment factors: {requested_version}"
+            )
+        if len(matches) != 1:
+            raise QDataValidationError(
+                f"data_version selection is ambiguous for adjustment factors: {requested_version}"
+            )
+        return matches[0]
 
     def get_dataset_health(
         self,

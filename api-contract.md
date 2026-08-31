@@ -1816,6 +1816,8 @@ POST /v1/market/adjustment-factor
 | `end_date` | string | 是 | 无 | 结束日期 |
 | `factor_type` | string | 否 | `both` | `forward`、`backward`、`both` |
 | `query_mode` | string | 否 | `latest` | 查询模式 |
+| `asof_time` | string | 条件必填 | `null` | `asof` 模式的带时区 ISO-8601 knowledge cutoff |
+| `data_version` | string | 条件必填 | `null` | `vintage` 模式的精确数据版本 |
 
 响应字段：
 
@@ -1827,11 +1829,12 @@ POST /v1/market/adjustment-factor
 | `factor_backward` | number | 后复权因子 |
 | `ex_right_type` | string | 除权除息类型 |
 
-公开复权因子接口当前只支持 `latest`。SQL selector 仅接纳与
-`adjustment_factor` dataset 精确绑定、批次 `success` 且已完成、版本状态为
-`active`/`superseded` 的行；orphan、running、failed 或 `recalled` 版本不可见。
-范围结果与行情一致，按每个交易日标注历史 ticker；`asof`/`vintage` 因当前签名
-不能完整表达 cutoff/version 而 fail closed。
+公开复权因子接口支持 `latest`、`asof` 与 `vintage`。`asof` 必须提供带时区的
+`asof_time`，`vintage` 必须提供 `data_version`，其余选择器组合 fail closed。SQL
+selector 仅接纳与 `adjustment_factor` dataset 精确绑定、批次 `success` 且已完成、
+版本状态为 `active`/`superseded` 的行；orphan、running、failed 或 `recalled` 版本
+不可见。`asof` 同时限制版本生效、批次完成、ingest、announce 和 effective 时间；
+范围结果与行情一致，按每个交易日标注历史 ticker。
 
 ### 5.5 获取交易约束
 
@@ -2069,7 +2072,9 @@ POST /v1/factors/values
 | `start_date` | string | 是 | 无 | 开始日期 |
 | `end_date` | string | 是 | 无 | 结束日期 |
 | `factor_version` | string | 否 | `published` | 因子版本 |
-| `query_mode` | string | 否 | `latest` | 当前只支持 `latest`；`asof`/`vintage` fail closed |
+| `query_mode` | string | 否 | `latest` | `latest`、`asof` 或 `vintage` |
+| `asof_time` | string | 条件必填 | `null` | `asof` 模式的带时区 ISO-8601 knowledge cutoff |
+| `data_version` | string | 条件必填 | `null` | `vintage` 模式的精确数据版本 |
 | `format` | string | 否 | `long` | `long` 或 `wide` |
 
 请求示例：
@@ -2286,17 +2291,18 @@ factors = client.get_factor(
     universe="zz800",
     start_date="2024-01-01",
     end_date="2024-12-31",
-    query_mode="latest",
+    query_mode="asof",
+    asof_time="2024-12-31T23:59:59+08:00",
     format="long"
 )
 ```
 
-当前公开 `get_factor` 与 `get_adjustment_factor` 签名不能完整表达 knowledge
-cutoff 或固定数据版本，因此只支持 `query_mode="latest"`；传入 `asof` 或
-`vintage` 会 fail closed。`start_date`/`end_date` 只过滤经济日期，不是 PIT
-可见性边界。SQL latest 只接纳成功、已完成、精确 batch-bound 且未 recalled 的
-dataset version；因子 payload 冲突会 fail closed。价格接口仍可按其完整参数使用
-下表三种模式。
+`get_factor` 与 `get_adjustment_factor` 都支持 `latest`、`asof` 和 `vintage`。
+`asof` 必须提供带时区的 `asof_time`，`vintage` 必须提供精确 `data_version`；
+互斥参数或缺少选择器会 fail closed。`start_date`/`end_date` 只过滤经济日期，
+`asof_time` 才是 PIT 可见性边界。SQL selector 只接纳成功、已完成、精确
+batch-bound 且未 recalled 的 dataset version；因子 `asof` 还限制 `calc_time`，
+payload 冲突会 fail closed。
 
 ### 6.11 `get_dataset_health`
 

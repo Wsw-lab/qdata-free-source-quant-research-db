@@ -582,9 +582,9 @@ class FinalPitSemanticsTest(unittest.TestCase):
             migration.read_text(encoding="utf-8"),
         )
 
-    def test_adjustment_and_factor_reject_modes_their_signatures_cannot_express(self) -> None:
+    def test_adjustment_and_factor_expose_asof_and_vintage_metadata(self) -> None:
         client = Client(default_format="records")
-        for method, kwargs in (
+        for method, kwargs, version in (
             (
                 client.get_adjustment_factor,
                 {
@@ -592,6 +592,7 @@ class FinalPitSemanticsTest(unittest.TestCase):
                     "start_date": "2024-01-02",
                     "end_date": "2024-01-02",
                 },
+                "adjustment_factor:mock-v1",
             ),
             (
                 client.get_factor,
@@ -601,15 +602,30 @@ class FinalPitSemanticsTest(unittest.TestCase):
                     "start_date": "2024-01-02",
                     "end_date": "2024-01-02",
                 },
+                "factor_value_daily:mock-v1",
             ),
         ):
-            for mode in ("asof", "vintage"):
-                with self.subTest(method=method.__name__, mode=mode):
-                    with self.assertRaisesRegex(
-                        QDataValidationError,
-                        "only supports query_mode='latest'",
-                    ):
-                        method(**kwargs, query_mode=mode)
+            with self.subTest(method=method.__name__, mode="asof"):
+                payload = method(
+                    **kwargs,
+                    query_mode="asof",
+                    asof_time="2024-01-02T23:59:59+08:00",
+                    include_meta=True,
+                )
+                self.assertEqual(payload["meta"]["query_mode"], "asof")
+                self.assertEqual(
+                    payload["meta"]["asof_time"],
+                    "2024-01-02T23:59:59+08:00",
+                )
+            with self.subTest(method=method.__name__, mode="vintage"):
+                payload = method(
+                    **kwargs,
+                    query_mode="vintage",
+                    data_version=version,
+                    include_meta=True,
+                )
+                self.assertEqual(payload["meta"]["query_mode"], "vintage")
+                self.assertEqual(payload["meta"]["data_version"], version)
 
     def test_factor_defaults_to_latest_and_returns_one_deterministic_revision(self) -> None:
         postgres = _FactorPostgres()

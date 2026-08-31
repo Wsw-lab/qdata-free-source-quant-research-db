@@ -9,7 +9,7 @@ QData 是一个 A 股研究数据工程原型。当前可在无网络、无 Dock
 | 能力 | 当前状态 | 可复验证据与边界 |
 |---|---|---|
 | `research_snapshot_v1` | 已实现 | 构建规范化 CSV/JSON manifest，记录 SHA-256、cutoff、timezone、source、data version、行数和质量状态；build 与 verify 均校验 `close_adjusted = close_raw * adjustment_factor`（绝对容差 `0.000001`），并在未知 schema、篡改、重复主键、缺失字段、晚到数据或矛盾价格三元组时 fail closed。公开 fixture 是合成合约样本，不是市场数据。 |
-| 本地 Python SDK | 已实现 | 默认 mock 后端可离线查询证券、日历、价格、交易约束、PIT 基本面、指数/行业、股票池、因子和健康信息。公开 `get_factor` 与 `get_adjustment_factor` 只支持 `query_mode="latest"`；它们的现有签名不能表达 knowledge cutoff 或固定数据版本，因此 `asof`/`vintage` 会 fail closed。SQL latest 只接纳 PostgreSQL 中成功、已完成且未 recalled 的精确 batch-bound dataset version。 |
+| 本地 Python SDK | 已实现 | 默认 mock 后端可离线查询证券、日历、价格、交易约束、PIT 基本面、指数/行业、股票池、因子和健康信息。公开 `get_factor` 与 `get_adjustment_factor` 均支持 `latest`、带时区 `asof_time` 的 `asof` 和固定 `data_version` 的 `vintage`；模式与选择器不匹配时 fail closed。SQL selector 只接纳 PostgreSQL 中成功、已完成且未 recalled 的精确 batch-bound dataset version。 |
 | 因子 API 前复权参考算术 | 已实现 | 收盘后信号 → 下一交易日前复权开盘参考值 → 同日前复权收盘标记；只验证 API、排序和参考值算术，未验证下一交易日可交易性，不是成交、执行或回测，也不是市场或投资证据。 |
 | 质量、版本与批次语义 | 单元验证 | 严格完整率门禁、显式分钟频率失败、PIT/版本过滤、不可变版本和批次生命周期由确定性 fake/unit test 覆盖。 |
 | ClickHouse vintage 迁移 selector | 本地集成验证 | 已在本地 Docker 的 ClickHouse 24.8.14.39 上从 fresh old-key full schemas 与 four source rows in one old-key part 跑通行情/因子 create-copy-EXCHANGE、old-key backup 与 OPTIMIZE FINAL。因子 fresh schema 和 `0062` 使用 plain `MergeTree` 保留等时刻冲突证据；完全相同重试折叠，不同 payload 会 fail closed。该证据不覆盖生产运行；CI does not run database integration。 |
@@ -48,7 +48,7 @@ python3 examples/build_research_snapshot.py verify /tmp/qdata-research-snapshot-
 
 正式研究输入应固定到已验证的不可变 snapshot，不应直接依赖未固定的 `latest` 响应。字段的经济日期不等于研究者当时已知；`available_at` 必须不晚于 snapshot cutoff。成对行情的信号可用时间取 daily bar 与 tradability 的较晚时间，并要求其在 manifest 时区内落在 `trade_date`。V1 只对 snapshot 中实际出现的市场日期检查活跃证券完整性；它不含交易所日历，因而无法识别所有证券均缺失的整日，要求连续交易日的研究需另行固定并校验权威日历。完整决策见[不可变快照 ADR](docs/adr/0001-research-snapshot-and-time-contract.md)。
 
-API 边界是有意收窄的：价格接口可通过完整参数表达 `latest`、`asof` 和 `vintage`；公开复权因子与因子值接口当前只能读取确定性 latest revision。SQL latest 会先从 PostgreSQL 解析成功、已完成且状态为 `active`/`superseded` 的 batch-bound dataset versions，再限制 ClickHouse/复权行；orphan、running、failed 与 recalled 版本不可见。完全相同的因子重试可折叠，同一 identity/data-version/calc-time 下 payload 不同则 fail closed。因子请求中的 `start_date`/`end_date` 只过滤经济日期，不代表当时可见。
+价格、复权因子与因子值接口都通过相同的严格选择器表达 `latest`、`asof` 和 `vintage`。`asof` 必须提供带时区的 `asof_time`，并同时约束版本生效/批次完成时间以及行级 ingest、announce、effective 或 calc 时间；`vintage` 必须提供唯一、精确 batch-bound 的 `data_version`。SQL selector 会先从 PostgreSQL 解析成功、已完成且状态为 `active`/`superseded` 的 dataset versions，再限制 ClickHouse/复权行；orphan、running、failed 与 recalled 版本不可见。完全相同的因子重试可折叠，同一 identity/data-version/calc-time 下 payload 不同则 fail closed。`start_date`/`end_date` 只过滤经济日期，只有 `asof_time` 才是历史可见性边界。
 
 SQL 主数据 producer 同样 fail closed：只有 symbol/name 的 placeholder 可建立当前行情映射，但不会写入 PIT 历史；ticker rename 必须携带稳定 `security_id` 和 effective date，若目标 ticker 已由另一 ID（包括 placeholder）占用则在主数据 batch 前拒绝，不做跨库自动 re-key。范围行情/复权/因子结果按每个 `trade_date` 标注历史 ticker，ticker recycling 造成多 ID 歧义时要求改用 stable ID。PIT 日期截止统一为 `Asia/Shanghai` 次日零点的排他边界。行业/指数/非规则股票池先选 natural-key revision，再只保留实体最新有效 episode；`universe_type` 不可原地改写。交易约束中的 ST 来自 PIT status，过滤依赖的字段缺少证据时排除该成员。
 

@@ -249,7 +249,7 @@ class PublicSurfaceContractTest(unittest.TestCase):
         payload = json.loads(notebook_path.read_text(encoding="utf-8"))
         self.assertEqual(payload["nbformat"], 4)
 
-    def test_public_contract_states_latest_only_factor_boundary_and_snapshot_formula(self) -> None:
+    def test_public_contract_states_versioned_factor_boundary_and_snapshot_formula(self) -> None:
         surfaces = {
             README_ZH: README_ZH.read_text(encoding="utf-8"),
             README_EN: README_EN.read_text(encoding="utf-8"),
@@ -261,6 +261,8 @@ class PublicSurfaceContractTest(unittest.TestCase):
         for path, text in surfaces.items():
             with self.subTest(path=path.relative_to(ROOT)):
                 self.assertIn("latest", text)
+                self.assertIn("asof", text.lower().replace("as-of", "asof"))
+                self.assertIn("vintage", text)
                 self.assertNotIn("Pull point-in-time factor values", text)
 
         for path in (README_ZH, README_EN):
@@ -271,14 +273,10 @@ class PublicSurfaceContractTest(unittest.TestCase):
                 )
 
         api_contract = (ROOT / "api-contract.md").read_text(encoding="utf-8")
-        self.assertIn(
-            "| `query_mode` | string | 否 | `latest` | 当前只支持 `latest`",
-            api_contract,
-        )
-        self.assertNotIn(
-            "| `query_mode` | string | 否 | `asof` | 默认 asof |",
-            api_contract,
-        )
+        self.assertIn("| `query_mode` | string | 否 | `latest` | `latest`、`asof` 或 `vintage` |", api_contract)
+        self.assertIn("| `asof_time` | string | 条件必填 | `null` |", api_contract)
+        self.assertIn("| `data_version` | string | 条件必填 | `null` |", api_contract)
+        self.assertNotIn("当前只支持 `latest`", api_contract)
 
 
 if __name__ == "__main__":

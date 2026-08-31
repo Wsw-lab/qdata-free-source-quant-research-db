@@ -495,12 +495,15 @@ class MockBackend:
         end_date: str | None,
         factor_type: str,
         query_mode: str,
+        asof_time: str | None,
+        data_version: str | None,
     ) -> dict[str, Any]:
-        if query_mode != "latest":
-            raise QDataValidationError(
-                "get_adjustment_factor only supports query_mode='latest'; its public "
-                "signature does not expose a knowledge cutoff or immutable data version"
-            )
+        self._validate_versioned_mode(
+            query_mode,
+            asof_time,
+            data_version,
+            expected_version="adjustment_factor:mock-v1",
+        )
         if not start_date or not end_date:
             raise QDataValidationError("start_date and end_date are required")
         self._date_range(start_date, end_date)
@@ -518,7 +521,13 @@ class MockBackend:
             for row in self.adjustment_factors
             if row["symbol"] in selected_symbols and start_date <= row["trade_date"] <= end_date
         ]
-        return self._response(self._project(rows, fields), ["adjustment_factor:mock-v1"], query_mode)
+        return self._response(
+            self._project(rows, fields),
+            ["adjustment_factor:mock-v1"],
+            query_mode,
+            asof_time,
+            data_version,
+        )
 
     def get_trading_constraints(
         self,
@@ -771,13 +780,16 @@ class MockBackend:
         end_date: str | None,
         factor_version: str,
         query_mode: str,
+        asof_time: str | None,
+        data_version: str | None,
         format: str,
     ) -> dict[str, Any]:
-        if query_mode != "latest":
-            raise QDataValidationError(
-                "get_factor only supports query_mode='latest'; its public signature "
-                "does not expose a knowledge cutoff or immutable data version"
-            )
+        self._validate_versioned_mode(
+            query_mode,
+            asof_time,
+            data_version,
+            expected_version="factor_value_daily:mock-v1",
+        )
         if not start_date or not end_date:
             raise QDataValidationError("start_date and end_date are required")
         self._date_range(start_date, end_date)
@@ -793,7 +805,13 @@ class MockBackend:
         ]
         if format == "wide":
             rows = self._factor_rows_to_wide(rows, factors)
-        return self._response(rows, ["factor_value_daily:mock-v1"], query_mode)
+        return self._response(
+            rows,
+            ["factor_value_daily:mock-v1"],
+            query_mode,
+            asof_time,
+            data_version,
+        )
 
     def get_dataset_health(
         self,
@@ -910,6 +928,48 @@ class MockBackend:
             },
             "errors": [],
         }
+
+    @staticmethod
+    def _validate_versioned_mode(
+        query_mode: str,
+        asof_time: str | None,
+        data_version: str | None,
+        *,
+        expected_version: str,
+    ) -> None:
+        MockBackend._validate_enum(query_mode, {"latest", "asof", "vintage"}, "query_mode")
+        if query_mode == "latest":
+            if asof_time is not None or data_version is not None:
+                raise QDataValidationError(
+                    "query_mode='latest' only accepts neither asof_time nor data_version"
+                )
+            return
+        if query_mode == "asof":
+            if data_version is not None:
+                raise QDataValidationError(
+                    "query_mode='asof' only accepts asof_time, not data_version"
+                )
+            if asof_time is None:
+                raise QDataValidationError("asof_time is required when query_mode='asof'")
+            try:
+                parsed = datetime.fromisoformat(asof_time.replace("Z", "+00:00"))
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise QDataValidationError(
+                    "asof_time must be a timezone-aware ISO-8601 datetime"
+                ) from exc
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise QDataValidationError(
+                    "asof_time must be a timezone-aware ISO-8601 datetime"
+                )
+            return
+        if asof_time is not None:
+            raise QDataValidationError(
+                "query_mode='vintage' only accepts data_version, not asof_time"
+            )
+        if data_version is None:
+            raise QDataValidationError("data_version is required when query_mode='vintage'")
+        if data_version != expected_version:
+            raise QDataNotFoundError(f"Unknown or unavailable data_version: {data_version}")
 
     @staticmethod
     def _project(rows: list[dict[str, Any]], fields: list[str] | None) -> list[dict[str, Any]]:

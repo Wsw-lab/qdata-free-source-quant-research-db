@@ -131,10 +131,11 @@ class Client:
         end_date: str | None = None,
         factor_type: str = "both",
         query_mode: str = "latest",
+        asof_time: str | None = None,
+        data_version: str | None = None,
         output_format: str | None = None,
         include_meta: bool = False,
     ) -> Any:
-        self._validate_latest_only_mode("get_adjustment_factor", query_mode)
         payload = self._backend.get_adjustment_factor(
             symbols=symbols,
             security_ids=security_ids,
@@ -142,6 +143,8 @@ class Client:
             end_date=end_date,
             factor_type=factor_type,
             query_mode=query_mode,
+            asof_time=asof_time,
+            data_version=data_version,
         )
         return self._format(payload, output_format, include_meta)
 
@@ -274,11 +277,12 @@ class Client:
         end_date: str | None = None,
         factor_version: str = "published",
         query_mode: str = "latest",
+        asof_time: str | None = None,
+        data_version: str | None = None,
         format: str = "long",
         output_format: str | None = None,
         include_meta: bool = False,
     ) -> Any:
-        self._validate_latest_only_mode("get_factor", query_mode)
         payload = self._backend.get_factor(
             factors=factors,
             symbols=symbols,
@@ -287,6 +291,8 @@ class Client:
             end_date=end_date,
             factor_version=factor_version,
             query_mode=query_mode,
+            asof_time=asof_time,
+            data_version=data_version,
             format=format,
         )
         return self._format(payload, output_format, include_meta)
@@ -346,11 +352,3 @@ class Client:
                 "Use output_format='records' or install qdata[dataframe]."
             ) from exc
         return pd.DataFrame(rows)
-
-    @staticmethod
-    def _validate_latest_only_mode(method: str, query_mode: str) -> None:
-        if query_mode != "latest":
-            raise QDataValidationError(
-                f"{method} only supports query_mode='latest'; its public signature "
-                "does not expose a knowledge cutoff or immutable data version"
-            )

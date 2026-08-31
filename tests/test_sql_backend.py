@@ -161,6 +161,8 @@ class FakePostgres:
                 continue
             if "batch_id = ANY(%(allowed_batch_ids)s)" in sql and item["batch_id"] not in allowed_batches:
                 continue
+            if "af.batch_id = %(batch_id)s" in sql and item["batch_id"] not in allowed_batches:
+                continue
             if ("dc.dataset_code = ANY(%(knowledge_dataset_codes)s)" in sql
                     and item["dataset_code"] not in knowledge_datasets):
                 continue
@@ -564,6 +566,37 @@ class SqlBackendTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["factor_forward"], 0.25)
 
+    def test_public_adjustment_factor_asof_excludes_late_revision(self) -> None:
+        factors = [self._factor_revision(1, 2, 0.5, "17:00"),
+                   self._factor_revision(2, 3, 0.25, "19:00")]
+        versions = [self._version(7001, 2, "success", "superseded", "17:00"),
+                    self._version(7002, 3, "success", "active", "19:00")]
+        postgres = FakePostgres(dataset_versions=versions, adjustment_factors=factors)
+
+        payload = self._client(postgres, FakeClickHouse()).get_adjustment_factor(
+            symbols=["600519.SH"], start_date="2024-01-02", end_date="2024-01-02",
+            factor_type="forward", query_mode="asof",
+            asof_time="2024-01-02T18:00:00+08:00", include_meta=True)
+
+        self.assertEqual(payload["data"][0]["factor_forward"], 0.5)
+        self.assertEqual(payload["meta"]["query_mode"], "asof")
+        self.assertEqual(payload["meta"]["asof_time"], "2024-01-02T18:00:00+08:00")
+
+    def test_public_adjustment_factor_vintage_uses_exact_batch(self) -> None:
+        factors = [self._factor_revision(1, 2, 0.5, "17:00"),
+                   self._factor_revision(2, 3, 0.25, "19:00")]
+        versions = [self._version(7001, 2, "success", "superseded", "17:00"),
+                    self._version(7002, 3, "success", "active", "19:00")]
+        postgres = FakePostgres(dataset_versions=versions, adjustment_factors=factors)
+
+        payload = self._client(postgres, FakeClickHouse()).get_adjustment_factor(
+            symbols=["600519.SH"], start_date="2024-01-02", end_date="2024-01-02",
+            factor_type="forward", query_mode="vintage",
+            data_version="daily_bar:v7001", include_meta=True)
+
+        self.assertEqual(payload["data"][0]["factor_forward"], 0.5)
+        self.assertEqual(payload["meta"]["data_version"], "daily_bar:v7001")
+
     def test_asof_excludes_adjustment_revision_with_unknown_availability(self) -> None:
         visible = self._factor_revision(1, 2, 0.5, "17:00")
         unavailable = self._factor_revision(2, 2, 0.25, "17:30")
@@ -745,6 +778,68 @@ class SqlBackendTest(unittest.TestCase):
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["factor_value"], 1.0)
+
+    def test_factor_asof_selects_only_versions_visible_at_cutoff(self) -> None:
+        versions = [
+            {"dataset_code": "factor_value_daily", "data_version": 7101,
+             "version_code": "factor_value_daily:old", "batch_id": 21,
+             "version_status": "superseded", "batch_status": "success",
+             "valid_from": aware("2024-01-02T18:30:00+08:00"),
+             "finished_at": aware("2024-01-02T18:31:00+08:00")},
+            {"dataset_code": "factor_value_daily", "data_version": 7102,
+             "version_code": "factor_value_daily:new", "batch_id": 22,
+             "version_status": "active", "batch_status": "success",
+             "valid_from": aware("2024-01-02T19:30:00+08:00"),
+             "finished_at": aware("2024-01-02T19:31:00+08:00")},
+        ]
+        factor_rows = [
+            {**self._factor_value(101, 1001, 1.0), "data_version": 7101,
+             "calc_time": aware("2024-01-02T18:30:00+08:00")},
+            {**self._factor_value(101, 1001, 9.0), "data_version": 7102,
+             "calc_time": aware("2024-01-02T19:30:00+08:00")},
+        ]
+        payload = self._client(
+            FakePostgres(dataset_versions=versions),
+            FakeClickHouse(factor_rows=factor_rows),
+        ).get_factor(
+            factors=["momentum_20d"], symbols=["600519.SH"],
+            start_date="2024-01-02", end_date="2024-01-02",
+            query_mode="asof", asof_time="2024-01-02T19:00:00+08:00",
+            include_meta=True)
+
+        self.assertEqual(payload["data"][0]["factor_value"], 1.0)
+        self.assertEqual(payload["meta"]["asof_time"], "2024-01-02T19:00:00+08:00")
+
+    def test_factor_vintage_selects_exact_immutable_version(self) -> None:
+        versions = [
+            {"dataset_code": "factor_value_daily", "data_version": 7101,
+             "version_code": "factor_value_daily:old", "batch_id": 21,
+             "version_status": "superseded", "batch_status": "success",
+             "valid_from": aware("2024-01-02T18:30:00+08:00"),
+             "finished_at": aware("2024-01-02T18:31:00+08:00")},
+            {"dataset_code": "factor_value_daily", "data_version": 7102,
+             "version_code": "factor_value_daily:new", "batch_id": 22,
+             "version_status": "active", "batch_status": "success",
+             "valid_from": aware("2024-01-02T19:30:00+08:00"),
+             "finished_at": aware("2024-01-02T19:31:00+08:00")},
+        ]
+        factor_rows = [
+            {**self._factor_value(101, 1001, 1.0), "data_version": 7101,
+             "calc_time": aware("2024-01-02T18:30:00+08:00")},
+            {**self._factor_value(101, 1001, 9.0), "data_version": 7102,
+             "calc_time": aware("2024-01-02T19:30:00+08:00")},
+        ]
+        payload = self._client(
+            FakePostgres(dataset_versions=versions),
+            FakeClickHouse(factor_rows=factor_rows),
+        ).get_factor(
+            factors=["momentum_20d"], symbols=["600519.SH"],
+            start_date="2024-01-02", end_date="2024-01-02",
+            query_mode="vintage", data_version="factor_value_daily:old",
+            include_meta=True)
+
+        self.assertEqual(payload["data"][0]["factor_value"], 1.0)
+        self.assertEqual(payload["meta"]["data_version"], "factor_value_daily:old")
 
     def test_recalled_adjustment_revision_cannot_override_active_revision(self) -> None:
         active = self._factor_revision(1, 2, 0.5, "17:00")
